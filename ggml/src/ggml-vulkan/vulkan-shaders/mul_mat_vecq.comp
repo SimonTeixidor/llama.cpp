@@ -4,9 +4,10 @@
 #extension GL_EXT_integer_dot_product : require
 
 #define MMQ
-// Opt in to the int8 IQ4_NL codebook in types.glsl. Only this shader defines it;
-// the FA variants force DATA_A_IQ4_NL + MMQ on and must not pick the array up.
-#define MMVQ_IQ4_NL_I8
+// Opt in to the int8 IQ4_NL/IQ4_XS codebook in types.glsl. Only the two
+// integer-dot shaders define this; the FA variants force DATA_A_IQ4_NL + MMQ
+// on and must not pick the array up.
+#define NEEDS_KVALUES_IQ4NL_I8
 #define NEEDS_IQ1S_GRID_GPU
 #define B_TYPE block_q8_1_x4
 

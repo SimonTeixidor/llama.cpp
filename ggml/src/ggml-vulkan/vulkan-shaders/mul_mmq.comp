@@ -19,6 +19,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #endif
 
+// Opt in to the int8 IQ4_NL/IQ4_XS codebook in types.glsl (IQ4_XS MMQ looks the
+// codebook up in block_a_to_shmem). Must precede the types.glsl include.
+#define NEEDS_KVALUES_IQ4NL_I8
+
 #include "types.glsl"
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;

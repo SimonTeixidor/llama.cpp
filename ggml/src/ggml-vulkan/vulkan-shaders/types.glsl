@@ -1818,9 +1818,10 @@ shared FLOAT_TYPE kvalues_iq4nl[16];
 // that includes this header is bit-identical. NOT guarded on plain
 // DATA_A_IQ4_NL: the flash-attention variants force DATA_A_IQ4_NL on and some
 // of them also define MMQ, so an IQ4_NL guard would leak this array into FA.
-// IQ4_NL therefore opts in explicitly via MMVQ_IQ4_NL_I8, which only
-// mul_mat_vecq.comp defines -- FA never does, so FA stays bit-identical.
-#if (defined(MMQ) && defined(DATA_A_IQ4_XS)) || (defined(MMVQ_IQ4_NL_I8) && defined(DATA_A_IQ4_NL))
+// The two integer-dot shaders therefore opt in explicitly via
+// NEEDS_KVALUES_IQ4NL_I8 (mul_mat_vecq.comp and mul_mmq.comp). FA defines
+// neither, so FA stays bit-identical -- as does the float mat-vec/matmul path.
+#if defined(NEEDS_KVALUES_IQ4NL_I8) && (defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL))
 #define HAVE_KVALUES_IQ4NL_I8
 #endif
 

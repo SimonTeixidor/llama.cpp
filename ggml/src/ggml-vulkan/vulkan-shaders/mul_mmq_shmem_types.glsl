@@ -59,6 +59,16 @@ struct block_a_cache {
     int32_t qs[8];
     FLOAT_TYPE d;
 };
+#elif defined(DATA_A_IQ4_XS)
+// Same shape as MXFP4: the codebook lookup happens in block_a_to_shmem, so the
+// cache holds eight dwords of already-dequantized int8 weights plus one scalar
+// scale. IQ4_XS's scale is the superblock d folded with the sub-block's 6-bit
+// sub-scale -- affine-free, so no min term and a scalar rather than a vec2.
+#define QUANT_R_MMQ 2
+struct block_a_cache {
+    int32_t qs[8];
+    FLOAT_TYPE d;
+};
 #elif defined(DATA_A_Q2_K)
 #define QUANT_R_MMQ 4
 struct block_a_cache {

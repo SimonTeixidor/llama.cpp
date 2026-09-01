@@ -217,6 +217,65 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
 }
 #endif
 
+#if defined(DATA_A_IQ4_XS)
+// 4-byte loads for IQ4_XS superblocks (136 bytes). IQ4_XS is MXFP4's codebook
+// lookup wearing Q4_K's superblock indexing:
+//
+//  - `ib` is a 32-weight SUB-block index (the k-quant convention noted below),
+//    so the superblock is ib/8 and the sub-block within it is ib%8.
+//  - Within a sub-block the 16 payload bytes hold element j in the low nibble
+//    and element j+16 in the high nibble -- the "halves" arrangement MXFP4 and
+//    IQ4_NL also use. Verified against dequant_iq4_xs.comp and
+//    dequantize_row_iq4_xs(), not assumed from the shared comment.
+//  - packed32 dword (4*ib32 + iqs) covers bytes 16*ib32+4*iqs .. +3, so its low
+//    nibbles are A elements 4*iqs..+3 and its high nibbles are 16+4*iqs..+3.
+//    That is exactly MXFP4's qs[iqs] / qs[iqs+4] split, hence QUANT_R_MMQ 2 and
+//    iqs running 0..3.
+//  - The scale is the superblock's fp16 d times a 6-bit sub-scale split across
+//    scales_l (nibble ib32) and scales_h (2 bits at 2*ib32), biased by -32.
+//    One sub-scale covers all 32 weights of the sub-block, so it is written
+//    once, at iqs == 0, like every other type here. This is the same decode as
+//    get_d_scale() in mul_mat_vecq_funcs.glsl.
+//
+// Affine-free: no min/zero-point term, so cache_b.ds.y is unused.
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint ib_k = ib / 8;
+    const uint ib32 = ib % 8;
+
+    const uint32_t vui = data_a_packed32[ib_k].qs[ib32 * 4 + iqs];
+
+    const u8vec4 i_a0 = unpack8( vui       & 0x0F0F0F0F);
+    const u8vec4 i_a1 = unpack8((vui >> 4) & 0x0F0F0F0F);
+
+    buf_a[buf_ib].qs[iqs    ] = pack32(i8vec4(kvalues_iq4nl_i8[i_a0.x], kvalues_iq4nl_i8[i_a0.y], kvalues_iq4nl_i8[i_a0.z], kvalues_iq4nl_i8[i_a0.w]));
+    buf_a[buf_ib].qs[iqs + 4] = pack32(i8vec4(kvalues_iq4nl_i8[i_a1.x], kvalues_iq4nl_i8[i_a1.y], kvalues_iq4nl_i8[i_a1.z], kvalues_iq4nl_i8[i_a1.w]));
+
+    if (iqs == 0) {
+        const uint sl = (data_a_packed32[ib_k].scales_l >> (4 * ib32)) & 0xF;
+        const uint sh = (uint(data_a_packed32[ib_k].scales_h) >> (2 * ib32)) & 3;
+
+        buf_a[buf_ib].d = FLOAT_TYPE(float(data_a_packed32[ib_k].d) * float(int(sl | (sh << 4)) - 32));
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].d = buf_a[buf_ib].d;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum = 0;
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+
+    return ACC_TYPE(float(cache_a[ib_a].d) * float(cache_b.ds.x) * float(q_sum));
+}
+#endif
+
 // For k-quants, ib and iqs still assume 32-wide blocks, but k-quants are 256-wide
 // iqs still refers to a 32-bit integer, meaning 0..7 for 32-wide quants
 #if defined(DATA_A_Q2_K)
