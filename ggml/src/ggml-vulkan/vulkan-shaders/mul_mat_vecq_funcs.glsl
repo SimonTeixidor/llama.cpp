@@ -157,6 +157,39 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 }
 #endif
 
+#if defined(DATA_A_IQ4_NL)
+// IQ4_NL is MXFP4's twin: a 32-weight block, 16 payload bytes, element j in the
+// low nibble of byte j and element j+16 in the high nibble (verified against
+// dequant_iq4_nl.comp and dequantize_row_iq4_nl() in ggml-quants.c, which both
+// read qs[j] & 0xF -> y[j] and qs[j] >> 4 -> y[j+16]). It declares QUANT_R 2,
+// so the QUANT_R == 2 arm of mmvq_dot_product below pairs cache_b_qs[0] with
+// the low-nibble half and cache_b_qs[1] with the high-nibble half, exactly as
+// for MXFP4.
+//
+// 2-byte loads for IQ4_NL blocks (18 bytes: fp16 d + 16 qs). The block is only
+// 2-byte aligned so there is no dword view; packed16 gives the widest legal
+// load, and two of them reassemble bytes 4*iqs .. 4*iqs+3.
+//
+// Differences from MXFP4, both accounted for: the scale is the fp16 `d` that
+// the shared get_dm() at the top of this file already returns, and the
+// codebook is kvalues_iq4nl_i8 whose entries are the true weight values, so
+// mul_q8_1 carries no 0.5 factor (MXFP4's E2M1 table is pre-doubled).
+i32vec2 repack(uint ib, uint iqs) {
+    const uint32_t qs = pack32(u16vec2(data_a_packed16[ib].qs[iqs * 2    ],
+                                       data_a_packed16[ib].qs[iqs * 2 + 1]));
+
+    const u8vec4 i_a0 = unpack8( qs       & 0x0F0F0F0F);
+    const u8vec4 i_a1 = unpack8((qs >> 4) & 0x0F0F0F0F);
+
+    return i32vec2(pack32(i8vec4(kvalues_iq4nl_i8[i_a0.x], kvalues_iq4nl_i8[i_a0.y], kvalues_iq4nl_i8[i_a0.z], kvalues_iq4nl_i8[i_a0.w])),
+                   pack32(i8vec4(kvalues_iq4nl_i8[i_a1.x], kvalues_iq4nl_i8[i_a1.y], kvalues_iq4nl_i8[i_a1.z], kvalues_iq4nl_i8[i_a1.w])));
+}
+
+FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
+    return FLOAT_TYPE(float(q_sum) * da * dsb.x);
+}
+#endif
+
 #if defined(DATA_A_Q2_0)
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
@@ -169,7 +202,7 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     // 16 quants per call => divide sums by 32/16 = 2
     return mul_q8_1(q_sum, get_dm(ib_a), cache_b_ds, 2);
 }
-#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
+#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4) || defined(DATA_A_IQ4_NL)
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
 #if QUANT_R == 2

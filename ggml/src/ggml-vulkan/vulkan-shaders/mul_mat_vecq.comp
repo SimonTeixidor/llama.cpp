@@ -4,6 +4,9 @@
 #extension GL_EXT_integer_dot_product : require
 
 #define MMQ
+// Opt in to the int8 IQ4_NL codebook in types.glsl. Only this shader defines it;
+// the FA variants force DATA_A_IQ4_NL + MMQ on and must not pick the array up.
+#define MMVQ_IQ4_NL_I8
 #define NEEDS_IQ1S_GRID_GPU
 #define B_TYPE block_q8_1_x4
 
@@ -13,7 +16,11 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 #if defined(DATA_A_Q2_0) || defined(DATA_A_QUANT_K)
 #define K_PER_ITER 16
-#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
+#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4) || defined(DATA_A_IQ4_NL)
+// IQ4_NL is structurally an MXFP4 block: QUANT_K 32, QUANT_R 2, 16 payload
+// bytes holding element j in the low nibble and j+16 in the high nibble, one
+// scale per block. Only the scale type (fp16 d vs E8M0 e) and the codebook
+// differ, so it takes the same K_PER_ITER 8 / QUANT_R == 2 path.
 #define K_PER_ITER 8
 #elif defined(DATA_A_IQ4_XS)
 // Half a 32-weight sub-block per call. IQ4_XS is a 256-weight superblock with
