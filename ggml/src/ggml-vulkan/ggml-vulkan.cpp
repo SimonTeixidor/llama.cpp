@@ -8469,6 +8469,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
             case GGML_TYPE_Q5_1:
             case GGML_TYPE_Q8_0:
             case GGML_TYPE_MXFP4:
+            // IQ4_NL: these q8_1 whitelists are a SEPARATE gate from pipeline
+            // creation. Omitting the type here makes the lookup return nullptr
+            // and silently fall back to the float kernel -- the new mat-vec
+            // pipeline is created but never selected, and nothing errors.
+            case GGML_TYPE_IQ4_NL:
             case GGML_TYPE_IQ4_XS:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
@@ -8642,6 +8647,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
             case GGML_TYPE_Q5_1:
             case GGML_TYPE_Q8_0:
             case GGML_TYPE_MXFP4:
+            // IQ4_NL: these q8_1 whitelists are a SEPARATE gate from pipeline
+            // creation. Omitting the type here makes the lookup return nullptr
+            // and silently fall back to the float kernel -- the new mat-vec
+            // pipeline is created but never selected, and nothing errors.
+            case GGML_TYPE_IQ4_NL:
             case GGML_TYPE_IQ4_XS:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
