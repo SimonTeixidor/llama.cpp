@@ -317,7 +317,7 @@ void main() {
                 const uint r  = x / 8;
                 const uint is = x % 8;
                 const uint idx = pos_a + r * (p.stride_a / LOAD_VEC_A);
-                const uint ib = idx / 64;
+                const uint ib = idx / (QUANT_K / LOAD_VEC_A);
 
                 const vec2 loadd = vec2(data_a[ib].dm);
                 const uvec3 scales = uvec3(data_a_packed32[ib].scales[0],

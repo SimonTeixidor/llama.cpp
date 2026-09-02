@@ -251,7 +251,9 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const float d = scache_dm[col * 8 + 2 * n + b].x;
             const float m = scache_dm[col * 8 + 2 * n + b].y;
 #else
+#if LOAD_VEC_A != 8
             const uint is = 2 * n + b;                 // 0..7
+#endif
 
             const vec2 loadd = vec2(data_a[ib].dm);
 
@@ -282,6 +284,18 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #elif defined(DATA_A_Q5_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
+#if LOAD_VEC_A == 8
+            // 8 weights per call: they always sit inside one 32-weight sub-block, so the
+            // 6-bit scale/min decode below runs once per 8 weights instead of once per 4.
+            const uint ib = idx / 32;                  // 8 values per idx
+            const uint w0 = (idx % 32) * 8;            // 0,8,16..248 (weight offset in the superblock)
+
+            const uint n = w0 / 64;                    // 0,1,2,3
+            const uint b = (w0 % 64) / 32;             // 0,1 (nibble half)
+            const uint qsi = n * 32 + (w0 % 32);       // byte index into qs, multiple of 8
+            const uint qhi = w0 % 32;                  // byte index into qh, multiple of 8
+            const uint is = 2 * n + b;                 // 0..7
+#else
             const uint ib = idx / 64;                  // 4 values per idx
             const uint iqs = (idx % 64) * 2;           // 0,2,4..126
 
@@ -289,13 +303,16 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint b = (iqs % 32) / 16;            // 0,1
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
             const uint qhi = (iqs % 16) * 2;           // 0,2,4..30
+#endif
 
 #ifdef MMID_QK_SCACHE
             // (d, m) precomputed per (tile row, sub-block) at superblock boundaries
             const float d = scache_dm[col * 8 + 2 * n + b].x;
             const float m = scache_dm[col * 8 + 2 * n + b].y;
 #else
+#if LOAD_VEC_A != 8
             const uint is = 2 * n + b;                 // 0..7
+#endif
 
             const vec2 loadd = vec2(data_a[ib].dm);
 
@@ -318,6 +335,20 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const float m = -loadd.y * mbyte;
 #endif
 
+#if LOAD_VEC_A == 8
+            const uint qs0 = (data_a_packed32[ib].qs[qsi / 4    ] >> (b * 4)) & 0x0F0F0F0F;
+            const uint qs1 = (data_a_packed32[ib].qs[qsi / 4 + 1] >> (b * 4)) & 0x0F0F0F0F;
+            const uint qh0 = ((data_a_packed32[ib].qh[qhi / 4    ] >> is) & 0x01010101) << 4;
+            const uint qh1 = ((data_a_packed32[ib].qh[qhi / 4 + 1] >> is) & 0x01010101) << 4;
+            const vec4 q0 = vec4(unpack8(qs0 | qh0));
+            const vec4 q1 = vec4(unpack8(qs1 | qh1));
+
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            store_a(col, k_pair,     FLOAT_TYPEV2(fma(d, q0.x, m), fma(d, q0.y, m)));
+            store_a(col, k_pair + 1, FLOAT_TYPEV2(fma(d, q0.z, m), fma(d, q0.w, m)));
+            store_a(col, k_pair + 2, FLOAT_TYPEV2(fma(d, q1.x, m), fma(d, q1.y, m)));
+            store_a(col, k_pair + 3, FLOAT_TYPEV2(fma(d, q1.z, m), fma(d, q1.w, m)));
+#else
             const uint qs = (data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F;
             const uint qh = ((data_a_packed32[ib].qh[qhi / 4] >> (iqs / 16)) & 0x01010101) << 4;
             const vec4 q = vec4(unpack8(qs | qh));
@@ -325,9 +356,35 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair,     FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m)));
             store_a(col, k_pair + 1, FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m)));
+#endif
 #elif defined(DATA_A_Q6_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
+#if LOAD_VEC_A == 4
+            // 4 weights per call: they share one 16-weight scale block, one nibble half and one
+            // qh shift, so the scale lookup and the d multiply run once per 4 weights and the
+            // ql/qh half-words come in adjacent pairs (one dword each).
+            const uint ib = idx / 64;                   // 4 values per idx
+            const uint iqs = idx % 64;                  // 0..63
+
+            const uint n = iqs / 32;                    // 0,1
+            const uint b = ((iqs % 32) / 16) * 4;       // 0,4
+            const uint is_b = (iqs % 8) / 4;            // 0,1
+            const uint qhshift = ((iqs % 32) / 8) * 2;  // 0,2,4,6
+            const uint is = 8 * n + qhshift + is_b;     // 0..15
+            const uint qsi = n * 32 + (iqs % 16) * 2;   // 0..62, pair base
+            const uint qhi = n * 16 + (iqs % 8) * 2;    // 0..30, pair base
+
+            const float dscale = float(data_a[ib].d) * float(data_a[ib].scales[is]);
+
+            const uint ql = ((uint(data_a_packed16[ib].ql[qsi]) | (uint(data_a_packed16[ib].ql[qsi + 1]) << 16)) >> b) & 0x0F0F0F0F;
+            const uint qh = ((uint(data_a_packed16[ib].qh[qhi]) | (uint(data_a_packed16[ib].qh[qhi + 1]) << 16)) >> qhshift) & 0x03030303;
+            const vec4 q = (vec4(unpack8(ql | (qh << 4))) - 32) * dscale;
+
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            store_a(col, k_pair,     FLOAT_TYPEV2(q.x, q.y));
+            store_a(col, k_pair + 1, FLOAT_TYPEV2(q.z, q.w));
+#else
             const uint ib = idx / 128;                  // 2 values per idx
             const uint iqs = idx % 128;                 // 0..127
 
@@ -346,6 +403,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const vec2 q = (vec2(unpack8(ql | (qh << 4)).xy) - 32) * dscale;
 
             store_a(col, row * LOAD_VEC_A / 2, FLOAT_TYPEV2(q.x, q.y));
+#endif
 #elif defined(DATA_A_IQ1_S)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
