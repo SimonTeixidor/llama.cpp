@@ -175,7 +175,14 @@ public:
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
 
+    // note: consumes the rollback index for the cell's sequence (see the .cpp) — call at most once
+    //       per decode, from set_input. Use is_s_copy_main_identity() for a side-effect-free probe.
     int32_t s_copy(int i) const;
+
+    // true when the main state rows are already in the cache slots that this ubatch will write
+    // back to, i.e. s_copy(i) == head + i for all i < n_seqs. build_rs() can then hand out a view
+    // of the cache instead of a get_rows copy. Never true while rollback snapshots are kept.
+    bool is_s_copy_main_identity(uint32_t n_seqs) const;
 
 private:
     const llama_memory_status status;
