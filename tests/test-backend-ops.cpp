@@ -9240,6 +9240,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // Decode shapes from the recurrent (Gated DeltaNet) models: an unbatched weight matrix (ne02 == 1)
+    // against a src1 that carries the sequence batch in ne12. The suite otherwise only covers ne12 == 2,
+    // which is too small for a per-batch-element dispatch to show up against the CPU reference.
+    for (int64_t nseq : {4, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120,  1,  6144, {1, 1}, {nseq, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120,  1,  6144, {1, 1}, {nseq, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 6144,  1,  5120, {1, 1}, {nseq, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 1,  5120, {1, 1}, {nseq, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 17408, 1,  5120, {1, 1}, {nseq, 1}));
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
