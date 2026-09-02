@@ -652,6 +652,15 @@ static constexpr std::initializer_list<ggml_op> topk_moe_late_softmax      { GGM
                                                                              GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
                                                                              GGML_OP_SOFT_MAX, GGML_OP_RESHAPE };
 
+// gated_delta_net -> view(new state) -> view(cache slot) -> cpy(state -> cache): the kernel writes
+// its final state straight into the cache slot (the cpy dst) and the cpy dispatch is elided.
+static constexpr std::initializer_list<ggml_op> gdn_state_cpy_pattern      { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
+static constexpr std::initializer_list<std::array<int, 3>> gdn_state_cpy_edges {
+    { 1, 0, 0 },  // view(new state) views the gdn dst
+    { 3, 0, 1 },  // cpy reads that view
+    { 3, 1, 2 },  // ... into the cache-slot view
+};
+
 // Snake activation: y = x + sin(a*x)^2 * inv_b. Used by the optimize_graph reorder
 // pass so it keeps the chain contiguous and by the dispatcher to detect the fusion.
 static constexpr std::initializer_list<ggml_op> snake_pattern              { GGML_OP_MUL,      GGML_OP_SIN,
@@ -2556,6 +2565,10 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+
+    // GDN_STATE_CPY fusion: per gated_delta_net node, how many graph edges read the final-state
+    // region of its dst (computed once per graph_compute). Fusable only when exactly one (the cpy).
+    std::unordered_map<const ggml_tensor *, int> gdn_state_readers;
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -6486,7 +6499,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -14505,12 +14518,17 @@ static void ggml_vk_gated_linear_attn(ggml_backend_vk_context * ctx, vk_context&
         pc, { (uint32_t)(n_seqs * n_heads), 1, 1 });
 }
 
-static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
 
     GGML_ASSERT(dst->buffer != nullptr);
+
+    // GDN_STATE_CPY: nodes[node_idx + 3] is the cpy that writes the new state into the recurrent
+    // cache; it is a view of the cache slot, so its subbuffer is the state-out target.
+    const bool fuse_state_cpy = ctx->num_additional_fused_ops == 3;
 
     const uint32_t S_v      = (uint32_t)src_v->ne[0];
     const uint32_t H        = (uint32_t)src_v->ne[1];
@@ -14520,7 +14538,7 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const uint32_t K = (uint32_t)ggml_get_op_params_i32(dst, 0);
 
-    const uint32_t s_off = S_v * H * n_tokens * n_seqs;
+    const uint32_t s_off = fuse_state_cpy ? 0 : S_v * H * n_tokens * n_seqs;
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
@@ -14532,6 +14550,7 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     for (int i = 0; i < 6; i++) {
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
     }
+    vk_subbuffer state_out_buf = fuse_state_cpy ? ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + 3]) : dst_buf;
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
@@ -14558,7 +14577,7 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, state_out_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -17647,7 +17666,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_GATED_DELTA_NET:
-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        ggml_vk_gated_delta_net(ctx, compute_ctx, cgraph, node_idx);
 
         break;
 
@@ -18823,6 +18842,74 @@ static bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const 
     return true;
 }
 
+// GDN_STATE_CPY: gated_delta_net (K == 1) -> view(final state) -> view(cache slot) -> cpy.
+// The kernel writes its final state straight into the cpy destination and the cpy dispatch is
+// elided. Combined with llama's in-place build_rs (the state input is that same cache slot) the
+// whole state round trip through the compute buffer disappears.
+
+// Byte offset of the final-state region inside a gated_delta_net dst (the attn output precedes it).
+static size_t ggml_vk_gdn_state_offset(const ggml_tensor * gdn) {
+    const ggml_tensor * v = gdn->src[2];
+    return (size_t) v->ne[0] * v->ne[1] * v->ne[2] * v->ne[3] * ggml_type_size(gdn->type);
+}
+
+// Once per graph: for each gated_delta_net node, how many graph edges read the final-state half of
+// its dst. The fusion leaves that half unwritten, so it needs the write-back cpy to be the only
+// reader. View nodes are skipped - they don't read their source, and their consumers show up in
+// this same scan with view_src == the gdn node and an absolute view_offs.
+static void ggml_vk_gdn_state_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->gdn_state_readers.clear();
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_op_is_empty(node->op)) {
+            continue;
+        }
+        for (uint32_t k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * src  = node->src[k];
+            const ggml_tensor * base = src ? (src->view_src ? src->view_src : src) : nullptr;
+            if (base && base->op == GGML_OP_GATED_DELTA_NET &&
+                src->view_offs + ggml_nbytes(src) > ggml_vk_gdn_state_offset(base)) {
+                ctx->gdn_state_readers[base]++;
+            }
+        }
+    }
+}
+
+static bool ggml_vk_can_fuse_gdn_state_cpy(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    // ops, node count and "all four are ours" in one go; edges below pin the shape of the chain
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, gdn_state_cpy_pattern,
+                                { node_idx, node_idx + 1, node_idx + 2, node_idx + 3 }) ||
+        !ggml_check_edges(cgraph, node_idx, gdn_state_cpy_edges)) {
+        return false;
+    }
+    const ggml_tensor * gdn        = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * state_view = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * cache_view = cgraph->nodes[node_idx + 2];
+
+    // only the single-snapshot form writes one final state at s_off, and only f32 is implemented.
+    // state_view and the cpy inherit their type from gdn and cache_view respectively.
+    if (ggml_get_op_params_i32(gdn, 0) != 1 || gdn->type != GGML_TYPE_F32 || cache_view->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // state_view must cover exactly the final-state region, and the cache slot must have the
+    // [S_v*S_v*H per seq] layout the kernel writes with.
+    const ggml_tensor * v         = gdn->src[2];
+    const size_t        seq_bytes = (size_t) v->ne[0] * v->ne[0] * v->ne[1] * sizeof(float);
+    if (state_view->view_offs != ggml_vk_gdn_state_offset(gdn) ||
+        ggml_nbytes(state_view) != seq_bytes * (size_t) v->ne[3] ||
+        ggml_nbytes(cache_view) != ggml_nbytes(state_view) ||
+        cache_view->nb[1] != seq_bytes || cache_view->ne[1] != v->ne[3] ||
+        !ggml_is_contiguous(state_view) || !ggml_is_contiguous(cache_view) ||
+        !ggml_is_contiguous(gdn->src[5])) {
+        return false;
+    }
+    // nothing but the cpy may read the (now unwritten) final-state region of gdn's dst.
+    // (An exact alias of the state input with the cpy destination - the in-place case - is allowed
+    // by the generic overlap check via op_srcs_fused_elementwise[0]; partial overlap disables it.)
+    auto it = ctx->gdn_state_readers.find(gdn);
+    return it != ctx->gdn_state_readers.end() && it->second == 1;
+}
+
 // Pattern check for the 5-op Snake fusion: mul -> sin -> sqr -> mul -> add.
 // Verifies the chain shape, the closure x_in_add == x_in_mul0, and that
 // the broadcast operands a and inv_b share a [1, C] layout.
@@ -19146,6 +19233,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         submit_count++;
     };
 
+    if (!ctx->device->disable_fusion) {
+        ggml_vk_gdn_state_prepass(ctx, cgraph);
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
@@ -19262,6 +19353,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = false;
+            } else if (ggml_vk_can_fuse_gdn_state_cpy(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 3;
+                // gated_delta_net still writes its attn output (bit 0); the cpy dst (bit 3) is the state.
+                ctx->fused_ops_write_mask |= 1 << 0;
+                fusion_string = "GDN_STATE_CPY";
+                // elementwise=true for the gdn node only, so that an exact alias of its state input
+                // with the cpy destination (the in-place update) passes the overlap check while a
+                // partial overlap still disables the fusion. Safe because each workgroup reads its
+                // whole [S_V x COLS_PER_WG] tile into registers before it writes any of it.
+                std::fill_n(op_srcs_fused_elementwise, 4, false);
+                op_srcs_fused_elementwise[0] = true;
             } else if (ggml_vk_can_fuse_snake(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 fusion_string = "SNAKE";
@@ -19528,23 +19630,33 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
     std::vector<bool> used(graph->n_nodes, false);
     std::set<ggml_tensor *> used_node_set;
 
+    // Check for fusion patterns and avoid reordering them
+    auto const &match_pattern = [&](const std::initializer_list<ggml_op> &pattern, int start) -> bool {
+        if (start + (int)pattern.size() <= graph->n_nodes) {
+            bool is_pattern = true;
+            for (size_t j = 0; j < pattern.size(); ++j) {
+                if (graph->nodes[start + j]->op != pattern.begin()[j] || used[start + j]) {
+                    is_pattern = false;
+                }
+            }
+            return is_pattern;
+        }
+        return false;
+    };
+
+    // keep_pattern() below emits a GDN_STATE_CPY chain as a unit, but its two view nodes have no
+    // unprocessed deps and would be hoisted into an earlier group before we ever get there, so mark
+    // every node of a chain as not-pullable. Without this the fusion never fires (measured).
+    std::vector<bool> pinned(graph->n_nodes, false);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (match_pattern(gdn_state_cpy_pattern, i)) {
+            std::fill_n(pinned.begin() + i, gdn_state_cpy_pattern.size(), true);
+        }
+    }
+
     int first_unused = 0;
     while (first_unused < graph->n_nodes) {
         std::vector<int> current_set;
-
-        // Check for fusion patterns and avoid reordering them
-        auto const &match_pattern = [&](const std::initializer_list<ggml_op> &pattern, int start) -> bool {
-            if (start + (int)pattern.size() <= graph->n_nodes) {
-                bool is_pattern = true;
-                for (size_t j = 0; j < pattern.size(); ++j) {
-                    if (graph->nodes[start + j]->op != pattern.begin()[j] || used[start + j]) {
-                        is_pattern = false;
-                    }
-                }
-                return is_pattern;
-            }
-            return false;
-        };
 
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
@@ -19579,6 +19691,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
+        if (keep_pattern(gdn_state_cpy_pattern)) {
+            continue;
+        }
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
@@ -19594,7 +19709,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
             if (used[j]) {
                 continue;
             }
-            if (is_empty(graph->nodes[j])) {
+            if (is_empty(graph->nodes[j]) || pinned[j]) {
                 continue;
             }
             // Don't pull forward nodes from fusion patterns
@@ -19721,7 +19836,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 if (used[j]) {
                     continue;
                 }
-                if (!is_empty(graph->nodes[j])) {
+                if (!is_empty(graph->nodes[j]) || pinned[j]) {
                     continue;
                 }
                 bool ok = true;

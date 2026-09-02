@@ -278,6 +278,10 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // llama_memory_recurrent_context::is_s_copy_main_identity() at graph build time; part of the
+    // reuse key, since a seq_cp between steps changes it (see build_rs / main_inplace).
+    bool s_copy_main_identity = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -1282,16 +1286,22 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
+                   bool   main_inplace = false) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
+    // allow_inplace: when the main state rows are already in place (s_copy_main_identity), return
+    // a view of the cache rows [head, head + n_seqs) instead of a get_rows copy. Only for consumers
+    // that read the whole state before the write-back cpy runs - true for any graph, since the cpy
+    // is ordered after the consumer, but not for a backend that fuses the two (see GDN_STATE_CPY).
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,
             ggml_tensor * s,
                 int32_t   state_size,
                 int32_t   n_seqs,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
+                   bool   allow_inplace = false) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
