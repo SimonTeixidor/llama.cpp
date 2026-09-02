@@ -10278,6 +10278,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Prefill (PP512) GEMM shapes of a 27B-class hybrid model, across quant types.
+    // A is >= 61 MB for every type here, so these are not last-level-cache numbers.
+    // Purpose: bound the total cost of on-the-fly dequantization (f16 is the ceiling).
+    {
+        struct pp_shape { int64_t m, k; const char * what; };
+        const pp_shape pp_shapes[] = {
+            { 17408, 5120,  "ffn_up/gate" },
+            {  5120, 17408, "ffn_down"    },
+            { 10240, 5120,  "attn_qkv"    },
+            {  5120, 6144,  "ssm_out"     },
+        };
+        for (const pp_shape & sh : pp_shapes) {
+            for (ggml_type type_a : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, sh.m, 512, sh.k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     for (ggml_type type_a : { GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS }) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 2048, 512, 4096));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 4096, 512, 2048));
