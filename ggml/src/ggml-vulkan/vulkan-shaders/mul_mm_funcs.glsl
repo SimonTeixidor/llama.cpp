@@ -385,7 +385,36 @@ void load_a_to_shmem(const uint pos_a, const uint a_off, const uint row, const u
 #elif defined(DATA_A_Q6_K)
             const uint idx = pos_a + a_off + row;
 
-#if LOAD_VEC_A == 4
+#if LOAD_VEC_A == 8
+            // 8 weights per call: an 8-aligned run of 8 never crosses a 16-weight scale block, a
+            // nibble half or a qh shift, so the scale byte fetch and the d multiply run once per 8
+            // weights instead of once per 4, and ql/qh come in adjacent dword pairs.
+            const uint ib = idx / 32;                   // 8 values per idx
+            const uint w0 = (idx % 32) * 8;             // 0,8,16..248 (weight offset in the superblock)
+
+            const uint n = w0 / 128;                    // 0,1
+            const uint b = ((w0 % 128) / 64) * 4;       // 0,4
+            const uint is_b = (w0 % 32) / 16;           // 0,1
+            const uint qhshift = ((w0 % 128) / 32) * 2; // 0,2,4,6
+            const uint is = 8 * n + qhshift + is_b;     // 0..15
+            const uint qsi = n * 32 + (w0 % 64) / 2;    // ql pair base
+            const uint qhi = n * 16 + (w0 % 32) / 2;    // qh pair base
+
+            const float dscale = float(data_a[ib].d) * float(data_a[ib].scales[is]);
+
+            const uint ql0 = ((uint(data_a_packed16[ib].ql[qsi    ]) | (uint(data_a_packed16[ib].ql[qsi + 1]) << 16)) >> b) & 0x0F0F0F0F;
+            const uint ql1 = ((uint(data_a_packed16[ib].ql[qsi + 2]) | (uint(data_a_packed16[ib].ql[qsi + 3]) << 16)) >> b) & 0x0F0F0F0F;
+            const uint qh0 = ((uint(data_a_packed16[ib].qh[qhi    ]) | (uint(data_a_packed16[ib].qh[qhi + 1]) << 16)) >> qhshift) & 0x03030303;
+            const uint qh1 = ((uint(data_a_packed16[ib].qh[qhi + 2]) | (uint(data_a_packed16[ib].qh[qhi + 3]) << 16)) >> qhshift) & 0x03030303;
+            const vec4 q0 = (vec4(unpack8(ql0 | (qh0 << 4))) - 32) * dscale;
+            const vec4 q1 = (vec4(unpack8(ql1 | (qh1 << 4))) - 32) * dscale;
+
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            store_a(col, k_pair,     FLOAT_TYPEV2(q0.x, q0.y));
+            store_a(col, k_pair + 1, FLOAT_TYPEV2(q0.z, q0.w));
+            store_a(col, k_pair + 2, FLOAT_TYPEV2(q1.x, q1.y));
+            store_a(col, k_pair + 3, FLOAT_TYPEV2(q1.z, q1.w));
+#elif LOAD_VEC_A == 4
             // 4 weights per call: they share one 16-weight scale block, one nibble half and one
             // qh shift, so the scale lookup and the d multiply run once per 4 weights and the
             // ql/qh half-words come in adjacent pairs (one dword each).
