@@ -234,6 +234,17 @@ void main() {
     const uint loadstride_a = gl_WorkGroupSize.x * LOAD_VEC_A_EFF * LOAD_VEC_BATCH_A / BK;
     const uint loadstride_b = gl_WorkGroupSize.x * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK;
 
+    // Loop-invariant part of the global A/B row addresses, hoisted out of the k-loop.
+    // The per-call form `col * p.stride_a / LOAD_VEC_A` is a 32-bit v_mul_lo_u32 -- quarter rate,
+    // measured at 3.9 cycles per issue slot in results/pp-night/30-valu-cadence.md -- and it was
+    // being recomputed once per loader call per BK=32 block (4 A calls + 4 B calls = 8 per block).
+    // `l` and the strides are uniform, so `l * stride_*_eff` folds to SALU and only the lane-varying
+    // base multiply survives, once, outside the loop.
+    const uint stride_a_eff = p.stride_a / LOAD_VEC_A_EFF;
+    const uint stride_b_eff = p.stride_b / LOAD_VEC_B_EFF;
+    const uint a_off_base   = loadc_a * stride_a_eff;
+    const uint b_off_base   = loadc_b * stride_b_eff;
+
 #ifdef MUL_MAT_ID
     if (p.use_row_lists != 0) {
         load_row_ids_from_lists(expert_idx, ic);
@@ -338,11 +349,11 @@ void main() {
         }
 #endif
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
-            load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
+            load_a_to_shmem(pos_a, a_off_base + l * stride_a_eff, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
 #if !defined(MUL_MAT_ID)
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
+            load_b_to_shmem(pos_b, b_off_base + l * stride_b_eff, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
 #else
             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
 #endif
