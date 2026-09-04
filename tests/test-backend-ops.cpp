@@ -10290,7 +10290,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             {  5120, 6144,  "ssm_out"     },
         };
         for (const pp_shape & sh : pp_shapes) {
-            for (ggml_type type_a : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+            for (ggml_type type_a : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, sh.m, 512, sh.k, {1, 1}, {1, 1}));
             }
         }
