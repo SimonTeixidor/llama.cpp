@@ -4446,22 +4446,46 @@ static int ggml_vk_dense_f16b_mode() {
 
 static bool ggml_vk_dense_f16b_enabled() { return ggml_vk_dense_f16b_mode() != 0; }
 
-// GGML_VK_MM_F32ACC (lever 17): force the coopmat MUL_MAT / MUL_MAT_ID pipelines onto the
-// f32-accumulator variant even when GGML_PREC_DEFAULT would allow f16 accumulation.
+// GGML_VK_MM_F32ACC (lever 17): the KHR-coopmat (coopmat1) MUL_MAT / MUL_MAT_ID pipelines
+// accumulate in f32 by DEFAULT, even where GGML_PREC_DEFAULT would allow f16 accumulation.
 //
-// Motivation: on RDNA3/3.5 under RADV, an f16-accumulate cooperative matrix multiply lowers to
-// v_wmma_f16_16x16x16_f16 *plus 16 v_mov_b16 per WMMA*, and measures 53.9 SIMD-cycles per WMMA
-// against 34.0 for v_wmma_f32_16x16x16_f16 -- 59% more (results/pp-night/25-int8-wmma-ceiling.md).
-// The counterweight is that an f32 accumulator fragment is 8 VGPRs per lane instead of 4, and this
-// kernel holds 8 of them, so VGPR pressure rises by ~32 and wave residency may fall.
-// Numerics: f32 accumulation is strictly wider, so results move (slightly) towards the reference.
-// 0 = off (default, f16acc as before), 1 = force f32acc.
-static bool ggml_vk_mm_f32acc_forced() {
-    static const bool forced = [] {
+// Why: on RDNA3/3.5 under RADV an f16-accumulate cooperative matrix multiply lowers to
+// v_wmma_f16_16x16x16_f16 *plus* accumulator shuffle moves. In the real quantized k-loop that is
+// 8 v_mov_b16 + 4 v_dual_mov_b32 per WMMA; selecting the f32acc pipeline deletes every one of them
+// (q5_K: 437 -> 280 instructions per BK=32 block, 128 v_mov_b16 + 32 v_dual_mov_b32 -> 0) while
+// leaving the 16 v_wmma and all loader work untouched.
+//
+// The feared register cost does not exist on this path: measured 192 -> 192 VGPRs and 8 -> 8
+// subgroups/SIMD on q4_0/q8_0/q5_K/q6_K (q4_K 168 -> 192, still 8 waves), because the f16acc form
+// was already spending an equal number of registers on the shadow set the movs shuffle into. LDS
+// per workgroup goes 22528 -> 26624 (the coopmat stage widens from f16 to f32), which was already
+// pre-paid: ggml_vk_matmul_shmem_support budgets that stage at sizeof(float) unconditionally.
+//
+// It is also strictly more accurate -- k here is 5120-17408, so an f16 accumulator sums thousands
+// of terms at 11 bits of mantissa and mul_mm.comp has to clamp the result to +/-ACC_TYPE_MAX
+// (65504) to stop it saturating. That clamp is compiled only into the f16acc variants
+// (vulkan-shaders-gen.cpp defines ACC_TYPE_MAX only when f16acc), so the default f32acc path never
+// executes it; the f16acc pipelines below still need it and it must stay.
+//
+// Measured on Qwen3.8-27B-Q4_K_M, deep-cooled ABBA at equal power (results/pp-night/26-f32acc.md):
+// PP +2.73 / +2.26 / +2.18 % at B=1/4/8, TG flat, perplexity 3.4801 -> 3.4754 (better).
+// Per-op means: q8_0 +5.2%, q6_K +3.5%, q4_0 +3.3%, q4_K +2.7%, f16 ~0%. CAVEAT: q5_K is the one
+// type whose per-op gain is not established (+1.9% and -0.3% across two chains), so a q5_K-heavy
+// model should expect nearer +1.0-1.5% end to end than +2.7%.
+//
+// Escape hatch: GGML_VK_MM_F32ACC=0 restores the previous f16-accumulator selection.
+static bool ggml_vk_mm_f32acc_enabled() {
+    static const bool enabled = [] {
         const char * e = getenv("GGML_VK_MM_F32ACC");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
-    return forced;
+    return enabled;
+}
+
+// Only coopmat1 is affected: this is a property of RADV's WMMA lowering. Scalar and coopmat2
+// devices keep whatever they selected before.
+static bool ggml_vk_mm_use_f32acc(const vk_device & device) {
+    return device->coopmat_support && !device->coopmat2 && ggml_vk_mm_f32acc_enabled();
 }
 
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -8412,7 +8436,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) {
         return ctx->device->pipeline_matmul_bf16;
     }
-    if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !ggml_vk_mm_f32acc_forced() && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
+    if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !ggml_vk_mm_use_f32acc(ctx->device) && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
             return ctx->device->pipeline_matmul_f16_f32.f16acc;
         }
@@ -8481,7 +8505,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     if (ctx->device->coopmat_support) {
         vk_matmul_pipeline2 & p = (src1_type == GGML_TYPE_F16) ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type]
                                                               : ctx->device->pipeline_dequant_mul_mat_mat[src0_type];
-        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT && !ggml_vk_mm_f32acc_forced()) ? p.f16acc : p.f32acc;
+        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT && !ggml_vk_mm_use_f32acc(ctx->device)) ? p.f16acc : p.f32acc;
     }
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
 }
@@ -8587,7 +8611,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
     if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) {
         return ctx->device->pipeline_matmul_id_bf16;
     }
-    if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !ggml_vk_mm_f32acc_forced() && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
+    if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !ggml_vk_mm_use_f32acc(ctx->device) && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
             return ctx->device->pipeline_matmul_id_f16_f32.f16acc;
         }
@@ -8653,7 +8677,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
         ? ctx->device->pipeline_dequant_mul_mat_mat_id_f16b[src0_type]
         : ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
     // XXX TODO 'prec' is not actually allowed in mul_mat_id.
-    bool prefer_fp16acc = ctx->device->fp16 && !ggml_vk_mm_f32acc_forced() /*&& prec == GGML_PREC_DEFAULT*/;
+    bool prefer_fp16acc = ctx->device->fp16 && !ggml_vk_mm_use_f32acc(ctx->device) /*&& prec == GGML_PREC_DEFAULT*/;
     bool support_fp16acc = !mmp.f16acc->is_empty();
     bool support_fp32acc = !mmp.f32acc->is_empty();
 
