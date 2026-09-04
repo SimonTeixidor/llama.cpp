@@ -239,12 +239,26 @@ void load_a_to_shmem(const uint pos_a, const uint a_off, const uint row, const u
 #elif defined(DATA_A_Q4_K)
             const uint idx = pos_a + a_off + row;
 
+#if LOAD_VEC_A == 8
+            // 8 weights per call: 8 consecutive weights are 8-aligned inside the superblock and a
+            // 32-weight sub-block boundary is 32-aligned, so they always share one sub-block and the
+            // packed 6-bit scale/min decode below runs once per 8 weights instead of once per 4.
+            // Same transform q5_K already uses; q4_K has the identical dm + scales[12] block prefix.
+            const uint ib = idx / 32;                  // 8 values per idx
+            const uint w0 = (idx % 32) * 8;            // 0,8,16..248 (weight offset in the superblock)
+
+            const uint n = w0 / 64;                    // 0,1,2,3
+            const uint b = (w0 % 64) / 32;             // 0,1 (nibble half)
+            const uint qsi = n * 32 + (w0 % 32);       // byte index into qs, multiple of 8
+            const uint is = 2 * n + b;                 // 0..7
+#else
             const uint ib = idx / 64;                  // 4 values per idx
             const uint iqs = (idx % 64) * 2;           // 0,2,4..126
 
             const uint n = iqs / 32;                   // 0,1,2,3
             const uint b = (iqs % 32) / 16;            // 0,1
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
+#endif
 
 #ifdef MMID_QK_SCACHE
             // (d, m) precomputed per (tile row, sub-block) at superblock boundaries
@@ -276,11 +290,22 @@ void load_a_to_shmem(const uint pos_a, const uint a_off, const uint row, const u
             const float m = -loadd.y * mbyte;
 #endif
 
+#if LOAD_VEC_A == 8
+            const vec4 q0 = vec4(unpack8((data_a_packed32[ib].qs[qsi / 4    ] >> (b * 4)) & 0x0F0F0F0F));
+            const vec4 q1 = vec4(unpack8((data_a_packed32[ib].qs[qsi / 4 + 1] >> (b * 4)) & 0x0F0F0F0F));
+
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            store_a(col, k_pair,     FLOAT_TYPEV2(fma(d, q0.x, m), fma(d, q0.y, m)));
+            store_a(col, k_pair + 1, FLOAT_TYPEV2(fma(d, q0.z, m), fma(d, q0.w, m)));
+            store_a(col, k_pair + 2, FLOAT_TYPEV2(fma(d, q1.x, m), fma(d, q1.y, m)));
+            store_a(col, k_pair + 3, FLOAT_TYPEV2(fma(d, q1.z, m), fma(d, q1.w, m)));
+#else
             const vec4 q = vec4(unpack8((data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F));
 
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair,     FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m)));
             store_a(col, k_pair + 1, FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m)));
+#endif
 #elif defined(DATA_A_Q5_K)
             const uint idx = pos_a + a_off + row;
 
