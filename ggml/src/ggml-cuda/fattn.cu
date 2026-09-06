@@ -88,6 +88,31 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
+    // On RDNA3.5 (gfx1151) the MMA flash-attention kernel is DRAM-bandwidth-bound at depth: the K/V
+    // cache is re-streamed once per Q tile, and a tile covers ncols1 = 64/ncols2 query positions x
+    // ncols2 GQA heads. Rounding ncols2 up to the next power of two above gqa_ratio (8 for a ratio of 6)
+    // leaves column slots zero-filled that still cost full WMMAs, and does not reduce the number of
+    // K/V passes. Picking the largest power of two that DIVIDES gqa_ratio minimises the passes instead.
+    // Measured on Qwen3.8-27B (hs 256, gqa 24/4 = 6, kv 32768, ub 512): ncols2 8 -> 2 fetches 25 % less
+    // K/V, the isolated kernel is 26 % faster and end-to-end prefill at d32768 gains +9.7 %.
+    // Only gqa_ratio == 6 has been measured; ratios that are powers of two are unaffected by this rule.
+    if (use_gqa_opt && GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        if (gqa_ratio % 8 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 4 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+            return;
+        }
+        if (gqa_ratio % 2 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            return;
+        }
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+        return;
+    }
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;
