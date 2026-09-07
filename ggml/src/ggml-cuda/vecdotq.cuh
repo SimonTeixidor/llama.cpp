@@ -94,13 +94,62 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
 #endif
 }
 
-static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
-    // v is a 7 bit int, with the 8th sign being encodable as popcnt
-    // with xor we can "correct" the bit instead of having to mask
+// v is a 7 bit int, with the 8th sign being encodable as popcnt
+// with xor we can "correct" the bit instead of having to mask.
+// Returns the 8 sign bits as a byte (bit i = sign of element i); callers hand the two
+// nibbles to apply_signs4. (It used to return that byte broadcast over the word so that
+// 0x08040201 / 0x80402010 could be used as __vcmpne4 selectors; nothing needs that now.)
+static __device__ __forceinline__ uint32_t unpack_ksigns8(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
-    const uint32_t s = v ^ p << 7;
-    // broadcast over uint to allow for 0x08040201 / 0x80402010 as selectors
-    return s * 0x01010101;
+    return v ^ p << 7;
+}
+
+// Apply per-byte signs to 4 packed int8 codebook values.
+//   sign_nib: bits 0..3, bit i == 1 means "negate byte i of g". Bits above 3 are ignored.
+//
+// Bit-exact replacement, for EVERY value of g and sign_nib, for the idiom used throughout the
+// IQ2/IQ3 unpack:
+//     const int s = __vcmpne4(<word whose byte i is nonzero iff bit i of sign_nib>, 0);
+//     out         = __vsub4(g ^ s, s);
+// with __vsub4 taken at its CUDA meaning (per-byte wrapping subtract). No precondition on g.
+//
+// Motivation: on HIP neither __vcmpne4 nor __vsub4 maps to an instruction (RDNA has no packed-byte
+// compare and no packed-byte subtract), so ggml-cuda/vendors/hip.h emulates both as scalar
+// 4-iteration byte loops. Measured on gfx1151, replacing that pair (together with the broadcast
+// sign word it needed) saves ~30 VALU ops per call site in the MMVQ kernels and ~38 in MMQ; the
+// sequence below is 8. E.g. mul_mat_q<IQ2_S,128> goes 2596 -> 1437 instructions, 32 call sites.
+//
+// Note that hip.h routes __vsub4 to __vsubss4, i.e. the HIP emulation *saturates*: for a grid byte
+// of 0x80 it returns +0x7f where CUDA's __vsub4 returns 0x80. That divergence is a property of the
+// emulation, not of the algorithm, and it is unreachable for every grid that reaches this helper
+// (byte alphabet of iq2xxs/iq2xs/iq2s/iq3xxs/iq3s: min 0x01, max 0x3e). The sequence below follows
+// the CUDA semantics on both vendors, which is the stronger of the two behaviours to match.
+static __device__ __forceinline__ int apply_signs4(const int g, const uint32_t sign_nib) {
+#if defined(GGML_USE_HIP)
+    // Negate byte i of g when bit i of sign_nib is set. Per byte that is two's complement:
+    // -x == (x ^ 0xff) + 1. Worked example, sign_nib = 0b1010, g = 0x01020304:
+    // ones = 0x01000100, mask = 0xff00ff00, result = 0xff02fd04 (bytes 1 and 3 negated).
+    //
+    // The mask to 4 bits is load-bearing: 64 of the 256 possible argument bytes are wrong
+    // without it. It folds away wherever the caller passes a value the compiler already
+    // sees is <= 15.
+    const uint32_t nib     = sign_nib & 0x0fu;       // the 4 sign bits, one per byte
+    // 0x00204081 has bits at 0, 7, 14, 21 - one per sign. The multiply adds a copy shifted
+    // by i for each set bit i, so bit i lands at 7i + i = 8i, the low bit of byte i. The four
+    // copies occupy the disjoint ranges {0..3}, {7..10}, {14..17}, {21..24}, so nothing carries.
+    const uint32_t spread  = nib * 0x00204081u;      // bit i -> bit 8i, plus 3 unwanted bits per copy
+    const uint32_t ones    = spread & 0x01010101u;   // keep bit 8i only: 0x01 per negated byte
+    const uint32_t mask    = (ones << 8) - ones;     // ones * 255: 0xff per negated byte
+    const uint32_t flipped = ((uint32_t) g) ^ mask;  // ones' complement of the negated bytes
+    // + 1 completes the two's complement, and must not carry out of its byte -- which it would
+    // for a grid byte of 0x00. Add only into the low 7 bits, where 0x7f + 1 == 0x80 still fits,
+    // and fold bit 7 back in with an XOR: if the low 7 bits carried into bit 7 the true bit 7 is
+    // inverted, which is exactly what the XOR does. No byte can then affect any other byte.
+    return (int) (((flipped & 0x7f7f7f7fu) + ones) ^ (flipped & 0x80808080u));
+#else
+    const int s = __vcmpne4((sign_nib * 0x01010101u) & 0x08040201u, 0);
+    return __vsub4(g ^ s, s);
+#endif // defined(GGML_USE_HIP)
 }
 
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
@@ -1049,15 +1098,13 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+        const uint32_t signs = unpack_ksigns8(aux32 >> (7 * k0 / 2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid0 = apply_signs4(grid_pos.x, signs);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid1 = apply_signs4(grid_pos.y, signs >> 4);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }
@@ -1086,14 +1133,12 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
-        const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
+        const uint32_t signs = unpack_ksigns8(q2[l0/2] >> 9);
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_l = apply_signs4(grid_pos.x, signs);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_h = apply_signs4(grid_pos.y, signs >> 4);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
@@ -1134,11 +1179,8 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-
-        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+        const int grid_l = apply_signs4(grid_pos[0], signs_packed_8[l0/2]);
+        const int grid_h = apply_signs4(grid_pos[1], signs_packed_8[l0/2] >> 4);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1173,15 +1215,13 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+        const uint32_t signs = unpack_ksigns8(aux32 >> (7*l0/2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_l = apply_signs4(grid_pos.x, signs);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_h = apply_signs4(grid_pos.y, signs >> 4);
 
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
@@ -1219,11 +1259,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_l = apply_signs4(grid_pos.x, signs_packed_8[l0/2]);
+        const int grid_h = apply_signs4(grid_pos.y, signs_packed_8[l0/2] >> 4);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
