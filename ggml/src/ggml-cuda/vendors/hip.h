@@ -291,18 +291,6 @@ static __device__ __forceinline__ int __vsub4(const int a, const int b) {
     return result_low_7bits ^ should_flip_high_1bit;
 }
 
-static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigned int b) {
-    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
-    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
-    unsigned int c;
-    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vc[i] = va[i] == vb[i] ? 0xff : 0x00;
-    }
-    return c;
-}
-
 static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
     const unsigned int x = a ^ b;
 
@@ -313,4 +301,8 @@ static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigne
     const unsigned int ne_any_bit = ne_low_7bits | ne_high_1bit;
 
     return (ne_any_bit >> 7) * 0xff;
+}
+
+static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigned int b) {
+    return ~__vcmpne4(a, b);
 }
