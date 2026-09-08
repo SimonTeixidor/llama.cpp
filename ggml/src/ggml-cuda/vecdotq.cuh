@@ -1308,18 +1308,14 @@ static __device__ __forceinline__ void vec_dot_iq3_s_q8_1_pair(
         const int2 grid0 = make_int2(
             iq3s_grid[qs0[l0 + 0] | ((qh0 << (8 - l0)) & 0x100)],
             iq3s_grid[qs0[l0 + 1] | ((qh0 << (7 - l0)) & 0x100)]);
-        const int s00 = __vcmpne4(((signs0[l0/2] & 0x03) << 7) | ((signs0[l0/2] & 0x0C) << 21), 0x00000000);
-        const int s01 = __vcmpne4(((signs0[l0/2] & 0x30) << 3) | ((signs0[l0/2] & 0xC0) << 17), 0x00000000);
-        sumi0 = ggml_cuda_dp4a(__vsub4(grid0.x ^ s00, s00), u0, sumi0);
-        sumi0 = ggml_cuda_dp4a(__vsub4(grid0.y ^ s01, s01), u1, sumi0);
+        sumi0 = ggml_cuda_dp4a(apply_signs4(grid0.x, signs0[l0/2]), u0, sumi0);
+        sumi0 = ggml_cuda_dp4a(apply_signs4(grid0.y, signs0[l0/2] >> 4), u1, sumi0);
 
         const int2 grid1 = make_int2(
             iq3s_grid[qs1[l0 + 0] | ((qh1 << (8 - l0)) & 0x100)],
             iq3s_grid[qs1[l0 + 1] | ((qh1 << (7 - l0)) & 0x100)]);
-        const int s10 = __vcmpne4(((signs1[l0/2] & 0x03) << 7) | ((signs1[l0/2] & 0x0C) << 21), 0x00000000);
-        const int s11 = __vcmpne4(((signs1[l0/2] & 0x30) << 3) | ((signs1[l0/2] & 0xC0) << 17), 0x00000000);
-        sumi1 = ggml_cuda_dp4a(__vsub4(grid1.x ^ s10, s10), u0, sumi1);
-        sumi1 = ggml_cuda_dp4a(__vsub4(grid1.y ^ s11, s11), u1, sumi1);
+        sumi1 = ggml_cuda_dp4a(apply_signs4(grid1.x, signs1[l0/2]), u0, sumi1);
+        sumi1 = ggml_cuda_dp4a(apply_signs4(grid1.y, signs1[l0/2] >> 4), u1, sumi1);
     }
 
     sumi0 *= 1 + 2*((bq0->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
