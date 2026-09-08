@@ -293,7 +293,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, bool exact_batch) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
@@ -330,6 +330,51 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q2_K:
                 return ne11 <= 6;
             default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        // Tuned on gfx1151 (Strix Halo) by timing both paths at the same ne11 with a temporary
+        //     dispatch override, on real model shapes. MMVQ re-reads the src1 column and redoes
+        //     the dot per output column while the weight unpack is hoisted out of the ncols_dst
+        //     loop, so its cost is A + ncols_dst*D with D dominated by the type's vec_dot. MMQ's
+        //     smallest instantiated tile here is J = 16, so one column tile covers the whole
+        //     ne11 = 1..16 range and MMQ's cost is flat across it (measured within 5 %). The
+        //     crossover is therefore a per-type constant, and it does not move with m or k once
+        //     MMQ fills a wave (ceil(m/64) >= 80): Q5_K measures 2.34 / 2.33 / 2.31 / 2.35 at
+        //     m = 5120 (k 6144), 5120 (k 17408), 17408 and 248320, i.e. from 1.0 to 48.5 waves.
+        if (exact_batch) {
+            // GGML_HINT_EXACT_BATCH promises that mul_mat over n columns equals n single-column
+            // mul_mats exactly. A per-type threshold inside [1, MMVQ_MAX_BATCH_SIZE] would send the
+            // batch to MMQ while the singles stay on MMVQ, and the two accumulate differently.
+            // Same reasoning as the BF16/MMVF case in ggml-cuda.cu.
+            return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+        switch (type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+                return ne11 <= 2;
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q6_K:
+                return ne11 <= 3;
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q2_K:
+                return ne11 <= 4;
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_MXFP4:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ3_XXS:
+                return ne11 <= 5;
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_IQ4_XS:
+            case GGML_TYPE_IQ1_S:
+                return ne11 <= 6;
+            default:
+                // Q1_0, Q2_0, IQ2_XXS, IQ2_XS and IQ2_S cross at 6.5-7.6 and NVFP4 does not
+                //     cross below 9, so the existing bound of 8 is kept for them.
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
