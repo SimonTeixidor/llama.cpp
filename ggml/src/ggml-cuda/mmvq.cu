@@ -293,9 +293,17 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, bool exact_batch) {
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_t ne11, bool exact_batch) {
     if (!ggml_is_quantized(type)) {
         return false;
+    }
+    // Below one MMQ tile there is no tiled kernel to fill. The smallest MMQ tile on RDNA3.5 is
+    //     I = 64 rows, so ne01 = 48 (the GDN alpha/beta projections) launches a single block and
+    //     leaves 39 of the 40 CUs idle, while MMVQ launches a block per row (or row pair). The
+    //     per-type thresholds below are all crossovers measured at m >= 5120, where MMQ fills the
+    //     device; they do not describe this regime.
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && ne01 < 64 && ne11 <= MMVQ_MAX_BATCH_SIZE) {
+        return true;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
