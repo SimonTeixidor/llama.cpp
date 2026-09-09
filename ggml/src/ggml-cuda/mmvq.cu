@@ -1357,10 +1357,71 @@ static __global__ void mul_mat_vec_iq3_s_lds_rdna3_5(
     GGML_UNUSED(ncols_x);
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+// RDNA3.5 only: the largest ncols_dst at which a block should own FOUR output rows instead of the
+// two that shipped in 5bc829e0c. 0 means "never promote", i.e. the type keeps two rows everywhere.
+//
+// Source of the numbers: results/rocm-fa-depth/night43/05-round2.md, lever "R2B", which set four
+// rows for EVERY type and every ncols_dst 2..8 and measured (a) the change in the per-column cost
+// slope D on top of the shipped two-row stack and (b) the static VGPR count of
+// mul_mat_vec_q<type,6> read out of the built object. Waves/SIMD below are derived from the VGPR
+// count (gfx11 wave32, 1536 VGPR per SIMD, granule 8, hardware ceiling 16).
+//
+// R2B was NOT shipped as a blanket change because two of its cells are negative, and both of those
+// are excluded here rather than averaged away. This table is the surviving subset.
+static constexpr __host__ __device__ int rdna3_5_rows4_max_ncols_dst(ggml_type type) {
+    switch (type) {
+        // Codebook / IQ types: D fell 13.2-28.6 % and the register growth still leaves 7-12 waves
+        //     per SIMD. D: iq1_m -28.6, iq2_xs -20.7, iq2_s -19.8, iq1_s -18.1, iq2_xxs -17.8,
+        //     iq4_xs -13.6, iq3_s -13.2. VGPR at ncols_dst=6, two rows -> four rows:
+        //     127->199, 105->155, 105->169, 91->118, 104->151, 116->164, 103->166. None spills.
+        // Capped at 6 because the ncols_dst 7 and 8 kernels are where R2B's register cliff sits
+        //     (see the default arm) and nothing in that sweep could price it.
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+            return 6;
+
+        // Q2_K: D fell 18.8 %, the largest gain outside the IQ set, but it is also the type with
+        //     the worst register growth -- 124->252 VGPR at ncols_dst=6, i.e. 12->6 waves per SIMD,
+        //     and mul_mat_vec_q<q2_K,8> goes to 256 VGPR with 20 spills / 84 B of scratch.
+        // Bounded at 4, not 6, because 4 is also ggml_cuda_should_use_mmvq's Q2_K threshold on this
+        //     arch: ncols_dst 5..8 for Q2_K is reachable only through the ne01 < 64 GDN path, which
+        //     the R2B sweep contains no case for. The measured -18.8 % comes entirely from
+        //     ncols_dst <= 4, so that is exactly how far it is applied.
+        case GGML_TYPE_Q2_K:
+            return 4;
+
+        // Deliberate negatives, listed so the measurement that excludes them is on the record:
+        //   q5_1  REGRESSED +30.7 % at ncols_dst=2, reproduced on two builds. Never promote.
+        //   q2_0  D rose 3.2 % (slower), so there is nothing to buy.
+        //   q1_0  D fell only 4.9 %, smaller than the 2.55 pp cross-sweep RMS of that experiment,
+        //         and it costs 16->11 waves per SIMD. Not established, so not taken.
+        //   q8_0  the two-point D fit was unusable (13.37 -> 15.30, i.e. pointing the wrong way).
+        //         It is also the one type with a dedicated q4-columns kernel at ncols_dst=4, so the
+        //         generic kernel only sees it at 2 and 3 below its threshold of 4.
+        //   NVFP4 mul_mat_vec_q<NVFP4,7> and <NVFP4,8> spill 24 and 68 registers (100 B / 276 B of
+        //         scratch) under R2B and no case in that sweep reaches them.
+        // Every type not named above -- k-quants other than Q2_K, Q4_0/Q4_1/Q5_0, MXFP4, IQ3_XXS,
+        //     IQ4_NL -- was not moved by R2B outside its noise band and keeps two rows as today.
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_NVFP4:
+        default:
+            return 0;
+    }
+}
+
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
         // nwarps is 1 here, so a block is a single wave and every lane re-reads the whole q8_1
-        // activation block for the row it owns. Two rows per block share those loads.
+        // activation block for the row it owns. Two rows per block share those loads; the types in
+        // rdna3_5_rows4_max_ncols_dst share them four ways.
         switch (ncols_dst) {
             case 2:
             case 3:
@@ -1369,7 +1430,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
             case 6:
             case 7:
             case 8:
-                return 2;
+                return ncols_dst <= rdna3_5_rows4_max_ncols_dst(type) ? 4 : 2;
             default:
                 return 1;
         }
@@ -1393,6 +1454,38 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// The promoted cells, one per justification group.
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   2, MMVQ_PARAMETERS_RDNA3_5) == 4);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_RDNA3_5) == 4);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ4_XS,  6, MMVQ_PARAMETERS_RDNA3_5) == 4);
+static_assert(calc_rows_per_block(GGML_TYPE_Q2_K,    4, MMVQ_PARAMETERS_RDNA3_5) == 4);
+
+// The cells the table deliberately refuses.
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   7, MMVQ_PARAMETERS_RDNA3_5) == 2);  // spill risk unpriced at 7/8
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   8, MMVQ_PARAMETERS_RDNA3_5) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_Q2_K,    5, MMVQ_PARAMETERS_RDNA3_5) == 2);  // above Q2_K's MMVQ threshold
+static_assert(calc_rows_per_block(GGML_TYPE_Q2_K,    8, MMVQ_PARAMETERS_RDNA3_5) == 2);  // 20 spills under R2B
+static_assert(calc_rows_per_block(GGML_TYPE_Q5_1,    2, MMVQ_PARAMETERS_RDNA3_5) == 2);  // +30.7 % regression
+static_assert(calc_rows_per_block(GGML_TYPE_Q2_0,    4, MMVQ_PARAMETERS_RDNA3_5) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_Q8_0,    2, MMVQ_PARAMETERS_RDNA3_5) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_NVFP4,   7, MMVQ_PARAMETERS_RDNA3_5) == 2);  // 24 spills under R2B
+static_assert(calc_rows_per_block(GGML_TYPE_Q4_K,    6, MMVQ_PARAMETERS_RDNA3_5) == 2);  // never listed
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   1, MMVQ_PARAMETERS_RDNA3_5) == 1);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   9, MMVQ_PARAMETERS_RDNA3_5) == 1);
+
+// Every other parameter table must be type-independent and bit-identical to what shipped: the type
+// argument is only ever read inside the RDNA3.5 arm.
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_GENERIC) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_Q5_1,    6, MMVQ_PARAMETERS_GENERIC) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   1, MMVQ_PARAMETERS_GENERIC) == 1);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   1, MMVQ_PARAMETERS_GENERIC, true, 4) == 4);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_GCN) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_TURING) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_GB10) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_RDNA4) == 1);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_RDNA3_0) == 1);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_RDNA2) == 1);
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -1412,8 +1505,12 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    // The epilogue writes row row0 + i from lane i, so a block can never own more rows than a wave
+    // has lanes. Two rows never came close; the RDNA3.5 four-row table makes this worth pinning.
+    static_assert(rows_per_cuda_block <= warp_size);
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -2473,7 +2570,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
