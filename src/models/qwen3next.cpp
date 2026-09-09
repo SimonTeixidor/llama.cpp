@@ -552,8 +552,10 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // 2-D, not [d, n_seq_tokens, n_seqs]: the projection below is immediately flattened to
+    // [n_embd, n_seq_tokens*n_seqs] anyway, and a 3-D src1 makes the mul_mat n_seqs separate
+    // ne11 = n_seq_tokens matmuls that each re-read the whole ssm_out weight.
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
     // Output projection
