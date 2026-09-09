@@ -1244,7 +1244,20 @@ static __global__ void mul_mat_vec_iq3_s_lds_rdna3_5(
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
-        return 1;
+        // nwarps is 1 here, so a block is a single wave and every lane re-reads the whole q8_1
+        // activation block for the row it owns. Two rows per block share those loads.
+        switch (ncols_dst) {
+            case 2:
+            case 3:
+            case 4:
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
