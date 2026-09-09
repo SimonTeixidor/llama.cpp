@@ -802,7 +802,7 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
                     sumi = ggml_cuda_dp4a(xv[i].x, get_int_b4(by->qs, 2*i + 0), sumi);
                     sumi = ggml_cuda_dp4a(xv[i].y, get_int_b4(by->qs, 2*i + 1), sumi);
                 }
-                sumi *= ls;
+                sumi = mul_scale_24(sumi, ls);
                 const float d = dx * __low2float(by->ds);
                 tmp[j] += d * sumi;
             }
@@ -1050,7 +1050,7 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_grid(
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
 
-    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    sumi = mul_scale_24(sumi, 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F));
 
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
     return d * sumi;

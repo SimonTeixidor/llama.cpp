@@ -152,6 +152,24 @@ static __device__ __forceinline__ int apply_signs4(const int g, const uint32_t s
 #endif // defined(GGML_USE_HIP)
 }
 
+// Multiply an accumulated dp4a sum by its integer block scale.
+//
+// On RDNA3 a full 32-bit integer multiply (v_mul_lo_u32) is quarter rate while the 24-bit form
+// (v_mul_i32_i24) is full rate. The multiply is SIGNED: the codebook bytes carry applied signs,
+// so sumi genuinely goes negative, and __umul24 would be wrong.
+//
+// Bit-exact when both operands fit in signed 24 bits, i.e. |x| <= 2^23, and the product fits in
+// int. Every call site bounds sumi as (number of dp4a terms) * (max |codebook byte|) * 128, and
+// the largest of those is the iq2 family at 16 * 43 * 128 = 88064, four hundred times inside the
+// bound; scales are 0..15 (iq2_xs, iq2_s) or 1..31 (iq3_s). See the commit message.
+static __device__ __forceinline__ int mul_scale_24(const int sumi, const int ls) {
+#if defined(GGML_USE_HIP)
+    return __mul24(sumi, ls);
+#else
+    return sumi * ls;
+#endif // defined(GGML_USE_HIP)
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -1149,7 +1167,7 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
             sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
         }
     }
-    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+    const int sumi = (mul_scale_24(sumi0, ls0) + mul_scale_24(sumi1, ls1) + (sumi0 + sumi1)/2)/4;
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
     return d * sumi;
 }
@@ -1193,7 +1211,7 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
             sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
         }
     }
-    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+    const int sumi = (mul_scale_24(sumi0, ls0) + mul_scale_24(sumi1, ls1) + (sumi0 + sumi1)/2)/4;
 
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
     return d * sumi;
@@ -1269,7 +1287,7 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
 
-    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    sumi = mul_scale_24(sumi, 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F));
 
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
     return d * sumi;
@@ -1318,8 +1336,8 @@ static __device__ __forceinline__ void vec_dot_iq3_s_q8_1_pair(
         sumi1 = ggml_cuda_dp4a(apply_signs4(grid1.y, signs1[l0/2] >> 4), u1, sumi1);
     }
 
-    sumi0 *= 1 + 2*((bq0->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
-    sumi1 *= 1 + 2*((bq1->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    sumi0 = mul_scale_24(sumi0, 1 + 2*((bq0->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F));
+    sumi1 = mul_scale_24(sumi1, 1 + 2*((bq1->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F));
     const float d8 = __low2float(bq8_1[iqs/2].ds);
     out0 = (__half2float(bq0->d) * d8) * sumi0;
     out1 = (__half2float(bq1->d) * d8) * sumi1;
