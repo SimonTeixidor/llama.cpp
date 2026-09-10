@@ -827,7 +827,6 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
             }
         } else if constexpr (type == GGML_TYPE_IQ3_S) {
             int2  xv[rpb][4];
-            int   ls[rpb];
             float dx[rpb];
 #pragma unroll
             for (int r = 0; r < rpb; ++r) {
@@ -843,10 +842,13 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
                     const int2 grid_pos = make_int2(
                         iq3s_grid[qs[l0 + 0] | ((qh << (8-l0)) & 0x100)],
                         iq3s_grid[qs[l0 + 1] | ((qh << (7-l0)) & 0x100)]);
-                    xv[r][i] = make_int2(apply_signs4(grid_pos.x, signs_packed_8[i]), apply_signs4(grid_pos.y, signs_packed_8[i] >> 4));
+                    xv[r][i] = make_int2(apply_signs4_nz(grid_pos.x, signs_packed_8[i]), apply_signs4_nz(grid_pos.y, signs_packed_8[i] >> 4));
                 }
-                ls[r] = 1 + 2*((bx->scales[kqs/4] >> ((kqs << 1) & 0x04)) & 0x0F);
-                dx[r] = __half2float(bx->d);
+                // L-EPI (results/2026-09-10-lever-mmvq6/): the integer block scale is folded
+                // into the float scale here exactly as vec_dot_iq3_s_q8_1 now does it, so the
+                // four-column kernel and the generic kernel stay in agreement.
+                const int ls = 1 + 2*((bx->scales[kqs/4] >> ((kqs << 1) & 0x04)) & 0x0F);
+                dx[r] = __half2float(bx->d) * (float) ls;
             }
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -865,9 +867,8 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
                         sumi = ggml_cuda_dp4a(xv[r][i].x, u[2*i + 0], sumi);
                         sumi = ggml_cuda_dp4a(xv[r][i].y, u[2*i + 1], sumi);
                     }
-                    sumi = mul_scale_24(sumi, ls[r]);
                     const float d = dx[r] * d8;
-                    tmp[j][r] += d * sumi;
+                    tmp[j][r] += d * (float) sumi;
                 }
             }
         } else if constexpr (type == GGML_TYPE_Q5_1) {
@@ -1147,8 +1148,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_grid(
             grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
-        const int grid_l = apply_signs4(grid_pos.x, signs_packed_8[l0/2]);
-        const int grid_h = apply_signs4(grid_pos.y, signs_packed_8[l0/2] >> 4);
+        const int grid_l = apply_signs4_nz(grid_pos.x, signs_packed_8[l0/2]);
+        const int grid_h = apply_signs4_nz(grid_pos.y, signs_packed_8[l0/2] >> 4);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1157,10 +1158,10 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_grid(
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
 
-    sumi = mul_scale_24(sumi, 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F));
-
-    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    // L-EPI: kept in step with vec_dot_iq3_s_q8_1.
+    const int ls = 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    const float d = (__half2float(bq3->d) * (float) ls) * __low2float(bq8_1[iqs/2].ds);
+    return d * (float) sumi;
 }
 
 // Direct kernel (same lane layout and accumulation order as mul_mat_vec_iq3_s_rows_rdna3_5) with the codebook
