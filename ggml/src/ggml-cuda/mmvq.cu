@@ -421,13 +421,20 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_
             case GGML_TYPE_Q5_1:
             case GGML_TYPE_MXFP4:
             case GGML_TYPE_IQ4_NL:
-            case GGML_TYPE_IQ3_XXS:
                 return ne11 <= 5;
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q5_0:
             case GGML_TYPE_IQ3_S:
             case GGML_TYPE_IQ4_XS:
             case GGML_TYPE_IQ1_S:
+            // IQ3_XXS moved 5 -> 6 on 2026-09-10 (results/2026-09-10-lever-mmqrouted/). Its 5 was
+            //     measured on 98d13960d, before rows_per_block = 2 took 17.8-48.3 % off the MMVQ
+            //     per-column slope; re-measured at ne11 = 6 on the four shapes it actually occurs
+            //     at in a 27B file, MMVQ is 4.8-14.6 % faster per call (t = -12.8 .. -18.2) and
+            //     end-to-end decode at 6 sequences gains +4.00 % (CI +2.06 .. +5.94 %, 8 arms per
+            //     side, 2 models). ne11 = 1 decode and prefill are null.
+            // The other types on the <= 5 label above have NOT been re-measured.
+            case GGML_TYPE_IQ3_XXS:
                 return ne11 <= 6;
             default:
                 // Q1_0, Q2_0, IQ2_XXS, IQ2_XS and IQ2_S cross at 6.5-7.6 and NVFP4 does not
