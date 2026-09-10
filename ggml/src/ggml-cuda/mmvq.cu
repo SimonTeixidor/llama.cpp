@@ -5,7 +5,9 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
+#include <vector>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -293,6 +295,46 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
+// LEVER (2026-09-10, results/2026-09-10-lever-mmqrouted/): runtime override of the per-type
+//     MMVQ/MMQ crossover on RDNA3.5, so that one binary can serve both arms of a comparison.
+// Format: GGML_MMVQ_THR="<ggml type id>:<max ne11 kept on MMVQ>[,...]", e.g. "18:6" for IQ3_XXS.
+// Unset (the default) changes nothing; a value of 0 for a type also means "no override".
+// The table below is tuned per type and was measured on a tree that predates the MMVQ
+//     rows-per-block work, hence this switch.
+static const int * ggml_cuda_mmvq_thr_override() {
+    static const std::vector<int> tbl = []() {
+        std::vector<int> t(GGML_TYPE_COUNT, 0);
+        const char * s = getenv("GGML_MMVQ_THR");
+        if (s == nullptr) {
+            return t;
+        }
+        const char * p = s;
+        while (*p) {
+            char * end = nullptr;
+            const long ty = strtol(p, &end, 10);
+            if (end == p || *end != ':') {
+                break;
+            }
+            p = end + 1;
+            const long thr = strtol(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            p = end;
+            if (ty >= 0 && ty < GGML_TYPE_COUNT && thr > 0) {
+                t[ty] = (int) thr;
+            }
+            if (*p == ',') {
+                ++p;
+            } else {
+                break;
+            }
+        }
+        return t;
+    }();
+    return tbl.data();
+}
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_t ne11, bool exact_batch) {
     if (!ggml_is_quantized(type)) {
         return false;
@@ -357,6 +399,13 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_
             // batch to MMQ while the singles stay on MMVQ, and the two accumulate differently.
             // Same reasoning as the BF16/MMVF case in ggml-cuda.cu.
             return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+        // LEVER: per-type crossover override, off unless GGML_MMVQ_THR is set. See above.
+        {
+            const int thr_env = ggml_cuda_mmvq_thr_override()[type];
+            if (thr_env > 0) {
+                return ne11 <= thr_env;
+            }
         }
         switch (type) {
             case GGML_TYPE_Q4_K:
