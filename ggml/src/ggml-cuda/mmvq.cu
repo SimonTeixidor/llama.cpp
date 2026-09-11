@@ -483,8 +483,34 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_
         //     MMQ prefetch, which makes the MMQ side of exactly these three cheaper). Same bounds:
         //     2, 2 and 4. Q6_K's crossover moves 4.80 -> 4.58, still clear of 4.
         //
-        //     NOT re-measured, and left alone: Q2_K, Q4_0, Q4_1, Q5_0, Q5_1, MXFP4, IQ4_NL, IQ1_S,
-        //     IQ2_XS, IQ2_XXS, NVFP4, Q1_0, Q2_0. No GGUF on the tuning box contains them.
+        //     The eleven types no local GGUF contains were swept afterwards at the generic 27B
+        //     shapes (5120x17408, 17408x5120, 5120x6144), same instrument and design. Their
+        //     bounds below are therefore measured at REPRESENTATIVE shapes, not at shapes from a
+        //     real file, and unlike the nine above they have no end-to-end confirmation, because
+        //     there is no model on the tuning box to run one on. Only Q1_0 and Q2_0 remain
+        //     entirely unmeasured.
+        //
+        //             A       D       Q     (Q-A)/D   bound   previous
+        //     IQ2_XS   83.1   33.0   501.1   12.7       8       8   RE-MEASURED, UNCHANGED
+        //     Q5_0    237.3   26.0   498.0   10.1       8       6
+        //     IQ2_XXS  71.3   33.1   400.3    9.9       8       8   RE-MEASURED, UNCHANGED
+        //     Q4_0    179.0   24.4   413.9    9.6       8       6
+        //     IQ1_S    45.7   31.0   337.0    9.4       8       6
+        //     IQ4_NL  184.4   27.8   407.3    8.0       6       5
+        //     MXFP4   168.3   28.2   386.0    7.7       6       5
+        //     Q4_1    212.4   22.0   378.4    7.5       6       5
+        //     Q2_K     55.5   97.3   736.0    7.0       6       4
+        //     NVFP4   103.7  112.1   572.8    4.2       4       8   LOWERED
+        //     Q5_1     49.9  151.3   437.4    2.6       2       5   LOWERED
+        //
+        //     Two of those are the table being wrong in the direction that costs, not the
+        //     direction that leaves something on the table. Q5_1 has the second-largest
+        //     per-column slope of any type here (151 us, above even Q4_K and Q5_K) and its bound
+        //     of 5 was sending it to MMVQ at ne11 = 3, 4 and 5 where MMVQ measures 25-33 %, 6-8 %
+        //     and 81-102 % SLOWER. NVFP4's bound of 8 was doing the same at ne11 = 5..8, where
+        //     MMVQ is 12-15 % slower at 5 and 37 % slower at 6; the previous comment's "NVFP4
+        //     does not cross below 9" does not reproduce. Both are resolved on all three shapes
+        //     (t = +5.9 .. +49.7).
         //
         //     KNOWN INCOMPLETE: the crossover is not a per-type constant, it is a per-(type, ne01)
         //     constant, and one number per type cannot express that. At ne01 = 1024 (attn_k,
@@ -494,6 +520,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_
         //     the FFN tensors carry far more bytes; the cost is that attn_k/attn_v stay on MMQ at
         //     ne11 = 3-5 where MMVQ is 8-18 % faster.
         switch (type) {
+            case GGML_TYPE_Q5_1:
+                // 5 -> 2. Crossover 2.50-2.58 over three shapes, D = 141-151 us/col. MMVQ is
+                //     3.7-11.0 % faster at ne11 = 2 and 25-33 % SLOWER at 3, so the previous
+                //     bound of 5 was a regression on every Q5_1 tensor at three to five columns.
+                //     Representative shapes; no local GGUF has Q5_1, so no end-to-end check.
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
                 // Crossover 2.5-2.8 (Q4_K) and 2.2-2.6 (Q5_K) across four and five shapes
@@ -504,9 +535,13 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_
                 // Crossover 3.5-4.0 over three shapes. MMVQ -9.9 % at ne11 = 3, +0.9 % at 4
                 //     (+6.3 / -3.0 / -0.7 per shape, i.e. no consistent win). Unchanged.
                 return ne11 <= 3;
-            case GGML_TYPE_Q2_K:
-                // NOT re-measured; no local GGUF contains Q2_K. Kept at its previous bound.
-                return ne11 <= 4;
+            case GGML_TYPE_NVFP4:
+                // 8 -> 4. Crossover 4.19-4.27 over three shapes, D = 41-112 us/col. MMVQ is
+                //     3.7-8.0 % faster at ne11 = 4 and 11.7-14.8 % slower at 5 (t = +5.9 .. +14.5)
+                //     and 36.6-37.5 % slower at 6. The previous bound of 8 also ran the
+                //     ncols_dst 7 and 8 kernels, which rdna3_5_rows4_max_ncols_dst already
+                //     records as spilling 24 and 68 registers under four rows per block.
+                //     Representative shapes; no local GGUF has NVFP4, so no end-to-end check.
             case GGML_TYPE_Q6_K:
                 // 3 -> 4. Crossover 4.7-4.9 over three shapes. MMVQ is 10.8-11.7 % faster at
                 //     ne11 = 4 (t = -7.6 .. -12.2, every CI clear of zero) and 1.9-5.4 % slower at
@@ -519,16 +554,14 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_
                 //     where the win is consistent. Not affected by the J = 16 prefetch, whose
                 //     Q8_0 entries are J = 48 and J = 128.
                 return ne11 <= 5;
+            case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q4_1:
-            case GGML_TYPE_Q5_1:
             case GGML_TYPE_MXFP4:
             case GGML_TYPE_IQ4_NL:
-                // NOT re-measured; no local GGUF contains them. Kept at their previous bound.
-                return ne11 <= 5;
-            case GGML_TYPE_Q4_0:
-            case GGML_TYPE_Q5_0:
-            case GGML_TYPE_IQ1_S:
-                // NOT re-measured; no local GGUF contains them. Kept at their previous bound.
+                // Q2_K 4 -> 6, the other three 5 -> 6. Crossovers 6.5-7.0 (Q2_K), 6.5-8.3 (Q4_1),
+                //     6.9-8.6 (MXFP4), 7.1-9.0 (IQ4_NL); in each case ne11 = 7 wins on two of the
+                //     three shapes but not on 5120x6144, so 6 is where the win is consistent.
+                //     Representative shapes; no local GGUF has them, so no end-to-end check.
                 return ne11 <= 6;
             default:
                 // IQ4_XS, IQ3_S and IQ3_XXS moved 6 -> 8 here and fall through to this arm.
@@ -540,8 +573,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_
                 //     all left the vector path in the same step at a verification width of 7,
                 //     taking the file from 29.6 % to 98.1 % on MMQ, which is why a draft length
                 //     of n_max = 6 measured 9 % SLOWER than 5 on the server before this change.
-                // Q1_0, Q2_0, IQ2_XXS, IQ2_XS and NVFP4 are here from the earlier tuning and were
-                //     not re-measured. IQ2_S was: crossover 12.4, so 8 is a cap for it too.
+                // Q4_0 (6 -> 8), Q5_0 (6 -> 8) and IQ1_S (6 -> 8) also land here: crossovers
+                //     8.4-10.6, 8.8-10.9 and 9.3-10.2 at the generic shapes, MMVQ faster at
+                //     ne11 = 8 by 8.7 %, 8.9 % and 10.5 % on average. IQ2_XS (12.7) and IQ2_XXS
+                //     (9.9) were re-measured and keep 8. IQ2_S was too: crossover 12.4. Q1_0 and
+                //     Q2_0 are the only two types in this function never measured on gfx1151.
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
