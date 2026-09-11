@@ -446,31 +446,102 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_
                 return ne11 <= thr_env;
             }
         }
+        // 2026-09-11, results/2026-09-10-crossover-retune/: the whole table below was re-measured.
+        //     Instrument: GGML_MMVQ_THR above, so ONE binary served both arms and the only
+        //     difference between them was the environment. Two arms (every type forced to MMVQ,
+        //     every type forced to MMQ), 4-6 position-balanced arms per side, at the (ne00 x ne01)
+        //     pairs each type actually takes in Qwen3.8-27B-UD-IQ4_XS.gguf. An f16 anchor moved
+        //     +0.28 % between arms and ne11 = 1, which no threshold can reach, is null for every
+        //     type, so the arms are comparable.
+        //
+        //     What is recorded per type is the COST FUNCTION, not just the crossover, because a
+        //     crossover is not durable -- it moves whenever either kernel changes, which is how
+        //     this table went stale twice. MMVQ costs A + ne11*D and MMQ costs a flat Q (measured:
+        //     Q varies 0.4-2.6 % over ne11 = 2..8, so "flat" is now checked rather than assumed),
+        //     giving crossover = floor((Q - A)/D). Units are us/run at ne00 = 5120, ne01 = 17408.
+        //
+        //             A       D       Q     (Q-A)/D   bound   previous
+        //     IQ2_S    82.3   34.3   506.8   12.4       8       8   (cap, not a crossover)
+        //     IQ3_XXS 112.3   34.0   406.7    8.7       8       6
+        //     IQ4_XS  156.1   26.9   410.3    9.5       8       6
+        //     IQ3_S   135.2   34.2   428.5    8.6       8       6
+        //     Q8_0    383.8   19.3   498.6    6.0       5       4
+        //     Q6_K    250.7   80.1   635.3    4.8       4       3
+        //     Q3_K    246.1   71.5   497.0    3.5       3       3   RE-MEASURED, UNCHANGED
+        //     Q4_K    119.3  109.7   411.1    2.7       2       2   RE-MEASURED, UNCHANGED
+        //     Q5_K    163.1  109.0   433.4    2.5       2       2   RE-MEASURED, UNCHANGED
+        //
+        //     The k-quants keeping 2-3 is the result, not an omission. Their per-column slope D is
+        //     107-110 us against 27-34 for the IQ types at the same shape, a factor of 3-4, which
+        //     is the "k-quants are expensive to decode and mvq redoes that per column" comment
+        //     above holding up under measurement. Q5_K was additionally measured at output.weight
+        //     (5120 x 248320, 834 MiB, the largest matmul in the file and live at ne11 = 6 during
+        //     speculative verification): D = 1069 us/col there and the crossover is 2.24, i.e. the
+        //     one shape that could have overturned the bound of 2 confirms it hardest.
+        //
+        //     Q4_K, Q5_K and Q6_K were re-measured a second time on top of 6cb4ed016 (the J = 16
+        //     MMQ prefetch, which makes the MMQ side of exactly these three cheaper). Same bounds:
+        //     2, 2 and 4. Q6_K's crossover moves 4.80 -> 4.58, still clear of 4.
+        //
+        //     NOT re-measured, and left alone: Q2_K, Q4_0, Q4_1, Q5_0, Q5_1, MXFP4, IQ4_NL, IQ1_S,
+        //     IQ2_XS, IQ2_XXS, NVFP4, Q1_0, Q2_0. No GGUF on the tuning box contains them.
+        //
+        //     KNOWN INCOMPLETE: the crossover is not a per-type constant, it is a per-(type, ne01)
+        //     constant, and one number per type cannot express that. At ne01 = 1024 (attn_k,
+        //     attn_v) MMQ launches 16 tiles against 40 CUs and the measured crossovers are Q4_K 4,
+        //     Q5_K 5, Q6_K >= 8, Q8_0 >= 8 -- two to four columns above the values below. The
+        //     bounds below are the ne01 >= 5120 values, which is the conservative choice because
+        //     the FFN tensors carry far more bytes; the cost is that attn_k/attn_v stay on MMQ at
+        //     ne11 = 3-5 where MMVQ is 8-18 % faster.
         switch (type) {
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
+                // Crossover 2.5-2.8 (Q4_K) and 2.2-2.6 (Q5_K) across four and five shapes
+                //     respectively, on both d6e477a70 and 6cb4ed016. MMVQ is 6-12 % faster at
+                //     ne11 = 2 and 10-25 % slower at ne11 = 3. Unchanged.
                 return ne11 <= 2;
             case GGML_TYPE_Q3_K:
-            case GGML_TYPE_Q6_K:
+                // Crossover 3.5-4.0 over three shapes. MMVQ -9.9 % at ne11 = 3, +0.9 % at 4
+                //     (+6.3 / -3.0 / -0.7 per shape, i.e. no consistent win). Unchanged.
                 return ne11 <= 3;
-            case GGML_TYPE_Q8_0:
             case GGML_TYPE_Q2_K:
+                // NOT re-measured; no local GGUF contains Q2_K. Kept at its previous bound.
                 return ne11 <= 4;
+            case GGML_TYPE_Q6_K:
+                // 3 -> 4. Crossover 4.7-4.9 over three shapes. MMVQ is 10.8-11.7 % faster at
+                //     ne11 = 4 (t = -7.6 .. -12.2, every CI clear of zero) and 1.9-5.4 % slower at
+                //     5. Re-measured on 6cb4ed016 as well, where the J = 16 prefetch makes MMQ
+                //     cheaper: crossover 4.58-4.62, bound still 4.
+                return ne11 <= 4;
+            case GGML_TYPE_Q8_0:
+                // 4 -> 5. Crossover 5.7-7.5 over three shapes. MMVQ is 6.4-11.4 % faster at
+                //     ne11 = 5 (t = -9.8 .. -14.7) and mixed at 6 (-6.6 / -1.8 / +2.3), so 5 is
+                //     where the win is consistent. Not affected by the J = 16 prefetch, whose
+                //     Q8_0 entries are J = 48 and J = 128.
+                return ne11 <= 5;
             case GGML_TYPE_Q4_1:
             case GGML_TYPE_Q5_1:
             case GGML_TYPE_MXFP4:
             case GGML_TYPE_IQ4_NL:
-            case GGML_TYPE_IQ3_XXS:
+                // NOT re-measured; no local GGUF contains them. Kept at their previous bound.
                 return ne11 <= 5;
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q5_0:
-            case GGML_TYPE_IQ3_S:
-            case GGML_TYPE_IQ4_XS:
             case GGML_TYPE_IQ1_S:
+                // NOT re-measured; no local GGUF contains them. Kept at their previous bound.
                 return ne11 <= 6;
             default:
-                // Q1_0, Q2_0, IQ2_XXS, IQ2_XS and IQ2_S cross at 6.5-7.6 and NVFP4 does not
-                //     cross below 9, so the existing bound of 8 is kept for them.
+                // IQ4_XS, IQ3_S and IQ3_XXS moved 6 -> 8 here and fall through to this arm.
+                //     MMVQ is faster at ne11 = 7 on all nine (type, shape) cells by 9.7-20.0 %,
+                //     every CI clear of zero, and at ne11 = 8 on all nine by mean, resolved on
+                //     seven. The fitted crossovers are 8.6-9.5, so 8 is MMVQ_MAX_BATCH_SIZE
+                //     biting, not a measured meeting point -- there is no ncols_dst > 8 kernel.
+                //     These three are 68.5 % of a 27B UD-IQ4_XS file's matmul weights and they
+                //     all left the vector path in the same step at a verification width of 7,
+                //     taking the file from 29.6 % to 98.1 % on MMQ, which is why a draft length
+                //     of n_max = 6 measured 9 % SLOWER than 5 on the server before this change.
+                // Q1_0, Q2_0, IQ2_XXS, IQ2_XS and NVFP4 are here from the earlier tuning and were
+                //     not re-measured. IQ2_S was: crossover 12.4, so 8 is a cap for it too.
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
