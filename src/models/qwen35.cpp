@@ -645,9 +645,17 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 
     cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
+
+    // masked mode reads the first n_outputs rows of t_h_nextn, so it must be the gathered output rows
+    // (else a decode with n_tokens > n_outputs returns the first row's hidden state)
+    if (!cparams.embeddings_nextn_masked) {
+        res->t_h_nextn = cur;
+    }
 
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    if (cparams.embeddings_nextn_masked) {
+        res->t_h_nextn = cur;
+    }
     cb(cur, "mtp_shared_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
