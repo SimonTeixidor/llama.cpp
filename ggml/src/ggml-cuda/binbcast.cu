@@ -645,9 +645,32 @@ static __global__ void weighted_expert_sum_f32(
     reinterpret_cast<float4 *>(dst)[index] = sum;
 }
 
+bool ggml_cuda_weighted_expert_sum_supported(const ggml_tensor * experts, const ggml_tensor * weights, const ggml_tensor * dst) {
+    // GGML_HIP_MOE_WREDUCE_UPSTREAM=1: leave the upstream moe_weighted_reduction match on its own kernel (A/B lever).
+    static const bool prefer_upstream = [] {
+        const char * env = getenv("GGML_HIP_MOE_WREDUCE_UPSTREAM");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const int64_t n_embd = experts->ne[0];
+    const int64_t n_used = experts->ne[1];
+    const int64_t n_tokens = experts->ne[2];
+    return !prefer_upstream &&
+        experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        n_embd % 4 == 0 && n_used >= 2 && n_used <= 16 && experts->ne[3] == 1 &&
+        weights->ne[0] == 1 && weights->ne[1] == n_used && weights->ne[2] == n_tokens && weights->ne[3] == 1 &&
+        dst->ne[0] == n_embd && dst->ne[1] == n_tokens && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+        ggml_is_contiguous(experts) && ggml_is_contiguous(weights) && ggml_is_contiguous(dst) &&
+        ggml_nelements(dst) <= UINT32_MAX;
+}
+
 void ggml_cuda_op_weighted_expert_sum(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * dst, int n_expert_used) {
     const ggml_tensor * experts = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
     const ggml_tensor * weights = experts == mul->src[0] ? mul->src[1] : mul->src[0];
+    ggml_cuda_op_weighted_expert_sum(ctx, experts, weights, dst, n_expert_used);
+}
+
+void ggml_cuda_op_weighted_expert_sum(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * weights,
+        ggml_tensor * dst, int n_expert_used) {
     const int64_t n_embd = experts->ne[0];
     const int64_t n_tokens = experts->ne[2];
     GGML_ASSERT(n_embd % 4 == 0);

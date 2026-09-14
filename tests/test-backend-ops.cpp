@@ -10347,6 +10347,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_weighted_expert_sum(128, 4, 5));
     test_cases.emplace_back(new test_weighted_expert_sum(2048, 8, 32));
     test_cases.emplace_back(new test_weighted_expert_sum(128, 16, 3));
+    test_cases.emplace_back(new test_weighted_expert_sum(2048, 8, 1));
+    test_cases.emplace_back(new test_weighted_expert_sum(2048, 8, 1024));
     test_cases.emplace_back(new test_shared_mul_add(127, 3));
     test_cases.emplace_back(new test_shared_mul_add(2048, 32));
     test_cases.emplace_back(new test_swiglu_q8_mmq(false, 1, 1, 2048, 32, 512));

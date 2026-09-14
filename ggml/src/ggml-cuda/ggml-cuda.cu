@@ -3952,6 +3952,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+#if defined(GGML_USE_HIP)
+                // HIP: the float4 flat-range weighted_expert_sum kernel is ~5 % faster on qwen35moe prefill (gfx1151)
+                if (match.expert_scale == nullptr && ggml_cuda_weighted_expert_sum_supported(match.experts, match.weights, match.dst)) {
+                    ggml_cuda_op_weighted_expert_sum(*cuda_ctx, match.experts, match.weights, match.dst, (int) match.experts->ne[1]);
+                    return match.node_count - 1;
+                }
+#endif // GGML_USE_HIP
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
