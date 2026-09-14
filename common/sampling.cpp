@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
@@ -152,13 +153,110 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+            if (fast_topk_k == -2) {
+                fast_topk_k = fast_topk_decide(vocab);
+            }
+            if (fast_topk_k > 0 && !rbudget_forcing()) {
+                fast_topk_fill(logits, n_vocab);
+            } else {
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
+    }
+
+    // MTPX_FAST_TOPK=1 (results/2026-09-12-mtp-opt/): when every sampler ahead of top-k is a no-op for
+    // these params, take the candidates straight from the raw logits instead of materialising all n_vocab
+    // llama_token_data entries and partial-sorting them. Exact: the candidate set is the top (k + #biased)
+    // raw logits plus every biased token, which contains the top-k by biased logit; candidates keep their
+    // raw logit and the chain (logit bias, top-k, ...) runs on them unchanged.
+    int fast_topk_decide(const llama_vocab * vocab) {
+        const char * e = getenv("MTPX_FAST_TOPK");
+        if (e == nullptr || atoi(e) == 0) {
+            return -1;
+        }
+        const auto & p = params;
+        if (p.mirostat != 0 || p.n_probs > 0 || grmr != nullptr || p.top_k <= 0 || p.top_k > 128) {
+            return -1;
+        }
+        const bool pen_noop = p.penalty_last_n == 0 ||
+            (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f);
+        const bool dry_noop = p.dry_multiplier == 0.0f || p.dry_penalty_last_n == 0;
+        const bool sig_noop = p.top_n_sigma <= 0.0f;
+        bool seen_topk = false;
+        for (const auto s : p.samplers) {
+            if (s == COMMON_SAMPLER_TYPE_TOP_K) {
+                seen_topk = true;
+                break;
+            }
+            if ((s == COMMON_SAMPLER_TYPE_PENALTIES && pen_noop) ||
+                (s == COMMON_SAMPLER_TYPE_DRY && dry_noop) ||
+                (s == COMMON_SAMPLER_TYPE_TOP_N_SIGMA && sig_noop)) {
+                continue;
+            }
+            return -1; // something that needs the whole vocabulary runs before top-k
+        }
+        if (!seen_topk) {
+            return -1;
+        }
+        fast_bias = p.logit_bias; // the chain's logit-bias sampler: user biases + model suppress tokens
+        int32_t n_suppress = 0;
+        const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+        for (int32_t i = 0; i < n_suppress; ++i) {
+            fast_bias.push_back({ suppress[i], -INFINITY });
+        }
+        LOG_INF("%s: MTPX_FAST_TOPK: top-%d candidates taken straight from the logits (%zu biased tokens)\n",
+                __func__, p.top_k, fast_bias.size());
+        return p.top_k;
+    }
+
+    bool rbudget_forcing() const {
+        if (rbudget == nullptr) {
+            return false;
+        }
+        const auto st = common_reasoning_budget_get_state(rbudget);
+        return st == REASONING_BUDGET_INTRO_FORCING || st == REASONING_BUDGET_SOFT_FORCING || st == REASONING_BUDGET_FORCING;
+    }
+
+    void fast_topk_fill(const float * logits, int n_vocab) {
+        const int m = std::min(n_vocab, fast_topk_k + (int) fast_bias.size());
+        static const auto cmp = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+        fast_heap.clear();
+        int i = 0;
+        for (; i < n_vocab && (int) fast_heap.size() < m; ++i) {
+            fast_heap.push_back({ i, logits[i], 0.0f });
+        }
+        std::make_heap(fast_heap.begin(), fast_heap.end(), cmp); // min-heap on logit
+        float thr = fast_heap.front().logit;
+        for (; i < n_vocab; ++i) {
+            const float l = logits[i];
+            if (l > thr) {
+                std::pop_heap(fast_heap.begin(), fast_heap.end(), cmp);
+                fast_heap.back() = { i, l, 0.0f };
+                std::push_heap(fast_heap.begin(), fast_heap.end(), cmp);
+                thr = fast_heap.front().logit;
+            }
+        }
+        cur.assign(fast_heap.begin(), fast_heap.end());
+        for (const auto & lb : fast_bias) {
+            if (lb.token < 0 || lb.token >= n_vocab) {
+                continue;
+            }
+            bool have = false;
+            for (const auto & c : cur) {
+                if (c.id == lb.token) {
+                    have = true;
+                    break;
+                }
+            }
+            if (!have) {
+                cur.push_back({ lb.token, logits[lb.token], 0.0f });
+            }
+        }
     }
 
     common_time_meas tm() {
@@ -166,6 +264,10 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+
+    int fast_topk_k = -2; // MTPX_FAST_TOPK: -2 undecided, -1 off, else k
+    std::vector<llama_logit_bias> fast_bias;
+    std::vector<llama_token_data> fast_heap;
 };
 
 std::string common_params_sampling::print() const {

@@ -685,8 +685,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
     // Only head sizes that have WMMA device code in flash_attn_ext_f16 (fattn-mma-f16.cuh, AMD_WMMA_AVAILABLE guard:
     // DKQ <= 128 or DKQ == 256) may be routed here; any other head size (e.g. 192) hits NO_DEVICE_CODE -> __trap().
+    // GGML_HIP_FA_RDNA35_D256_GATE=1 (default off, measurement lever): on RDNA3.5 leave D=256 to the fork's own rule
+    // below (MMA only for Q->ne[1]*gqa_ratio_eff > 32), as before upstream 16378d93f.
+    static const bool rdna35_d256_fork_gate = [] {
+        const char * env = getenv("GGML_HIP_FA_RDNA35_D256_GATE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const bool skip_wmma_gate = rdna35_d256_fork_gate && GGML_CUDA_CC_IS_RDNA3_5(cc) && Q->ne[0] == 256;
     if ((amd_wmma_available(cc) && gqa_opt_applies && (Q->ne[0] <= 128 || Q->ne[0] == 256)) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
-            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
+            !skip_wmma_gate && Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 

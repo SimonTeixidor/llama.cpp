@@ -1060,6 +1060,11 @@ struct common_memory {
 // Batch utils
 //
 
+// LLAMA_MTPX_TRACE=<file|stderr>: host-side phase marks for the MTP round profiler
+// (results/2026-09-12-mtp-opt/). One "MTPX <ggml_time_us> <tag> <a> <b>" line per mark. Off by default.
+bool common_mtpx_trace_on();
+void common_mtpx_mark(const char * tag, int a = 0, int b = 0);
+
 void common_batch_clear(struct llama_batch & batch);
 
 void common_batch_add(

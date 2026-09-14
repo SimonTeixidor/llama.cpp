@@ -663,6 +663,7 @@ struct server_slot {
     }
 
     void print_timings() const {
+        common_mtpx_mark("END");
         const double t_prompt_total = stats.t_prompt_ms();
         const double t_gen_total    = stats.t_gen_ms();
 
@@ -3058,6 +3059,8 @@ private:
             }
         }
 
+        common_mtpx_mark("U0");
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3131,6 +3134,8 @@ private:
                 break; // stop any further processing
             }
         }
+
+        common_mtpx_mark("U1");
     }
 
     void pre_decode() {
@@ -3270,7 +3275,9 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                common_mtpx_mark("D0");
                 common_speculative_draft(spec.get());
+                common_mtpx_mark("D1");
             });
         }
 
@@ -3915,9 +3922,12 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            common_mtpx_mark("V0", batch_view.n_tokens);
             ret = llama_decode(ctx_tgt, batch_view);
+            common_mtpx_mark("V1", ret);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
+                common_mtpx_mark("V2");
             }
         });
 
@@ -3980,7 +3990,9 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                common_mtpx_mark("P0", batch_view.n_tokens);
                 ok = common_speculative_process(spec.get(), batch_view);
+                common_mtpx_mark("P1");
             });
 
             if (!ok) {
@@ -4144,6 +4156,7 @@ private:
 
             // verify and try to accept the draft
             {
+                common_mtpx_mark("S0", (int) n_draft);
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
@@ -4167,6 +4180,7 @@ private:
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
                 slot.spec_i_batch.clear();
+                common_mtpx_mark("S1", (int) accepted.size());
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -4211,6 +4225,7 @@ private:
                 }
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_mtpx_mark("A1");
 
                 slot.spec_draft = std::move(accepted);
             }
@@ -4266,6 +4281,7 @@ private:
                 }
             }
 
+            common_mtpx_mark("T1", (int) ids.size());
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());

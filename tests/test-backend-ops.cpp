@@ -9071,6 +9071,22 @@ struct test_generic_op : public test_case {
                 init_tensor_uniform(t);
             }
         }
+
+        // The sentinel tensors that add_sentinel() puts before and after the graph are in this
+        // context but are not sources of `out`, so the loop above never touches them. The base
+        // class initialises every tensor in the context; this override did not, which left the
+        // sentinels holding whatever the freshly allocated backend buffer contained. Whenever
+        // that memory happened to hold NaN bit patterns, the comparison callback reported
+        //     [NONE] NaN at index N (ROCm0=nan CPU=nan)
+        // and the case FAILed on BOTH backends -- a false positive with no kernel involved, and
+        // one that only --test-file cases can hit, because every other test_case uses the base
+        // class initialiser. Measured on gfx1151: 77 % of --test-file MUL_MAT cases FAILed this
+        // way before this fix and 0 % after.
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strncmp(ggml_get_name(t), "sent_", 5) == 0) {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -11396,6 +11412,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {4, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {6, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // Qwen3.8 speculative verify widths (hs 256, GQA 24/4): nb 9-16 cross the RDNA3.5 tile/WMMA boundary
+    for (int nb : { 8, 9, 11, 16, 17 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
@@ -12145,6 +12165,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t kv : {4096, 8192, 12000, 16000, 24000, 32000, 64000}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    // Qwen3.8 speculative verify widths at depth (hs 256, GQA 24/4): RDNA3.5 tile vs WMMA at nb 9-16
+    for (int64_t kv : {8192, 32768}) {
+        for (int nb : { 6, 9, 11, 16, 24 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

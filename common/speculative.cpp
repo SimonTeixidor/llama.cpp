@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <map>
 #include <cinttypes>
+#include <random>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -250,7 +251,7 @@ struct common_speculative_impl {
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 
-    // (optional) per-request draft length controller summary, printed with the statistics
+    // (optional) per-request controller summary, printed with the statistics line
     virtual void print_ctl_stats() {}
 };
 
@@ -1452,42 +1453,67 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
-// Cost-aware draft length for the single-head MTP drafter. On when --spec-draft-n-min > 0.
-// Each drafted position j costs one draft step (s ms) and one verify column (C_j ms). It yields P_j output tokens
-// (P_j = P(positions 1..j all accepted)), each worth T ms (current time per output token). After sampling position j:
-//   keep j      if  P_j * T >= C_j
-//   draft j+1   if  E[max(0, P_j * g(j+1, p') * T - C_{j+1})] >= s, or a deeper expected-value path pays off
-// g(pos, p) = P(accepted | reached, pos, drafter top-1 p) is learned online from the verify results.
-// s, T and C_j are measured online. n_min and n_max stay hard bounds.
+// Cost-aware draft length for the single-head MTP drafter (results/2026-09-13-mtp-costaware/), on when --spec-draft-n-min > 0.
 //
-// C_j = V(j+1) - V(j), where V(w) is the verify cost at verify width w (drafted tokens + 1): the wall time from the end
-// of draft() to accept(), i.e. target decode, MTP catch-up decode and sampling. A level term absorbs drift that moves
-// every width alike (context depth, temperature) and restarts fast at each request; the level-detrended samples are
-// kept per width with decay. V is fit non-decreasing in w (pool adjacent violators) on top of a weak linear prior
-// whose slope is learned from the data, and the differences are smoothed and clamped to a small positive minimum.
-// A verify width next to the stopping point that has had almost no recent samples is drafted now and then.
-struct common_speculative_cost_ctl {
-    bool on = false;
+// MTP pays for every drafted position twice: one sequential draft step (s ms) and one more verify column
+// (C_j ms for the j-th position). Position j is worth P(positions 1..j all accepted) output tokens, each
+// worth T ms (the current time per output token -- using the policy's own T makes this the Dinkelbach
+// fixed point of tokens/time). So, inside the draft loop, after sampling position j with drafter top-1
+// probability p_j:
+//   keep j      iff  P_j * T >= C_j                          (its draft step is already paid)
+//   draft j+1   iff  E_{p'}[ max(0, P_j * g(j+1, p') * T - C_{j+1}) ] >= s
+// where P_j = prod_{i<=j} g(i, p_i) and g(pos, p) = P(accepted | reached, pos, p) is a calibration table
+// learned online from the target's verdicts (the drafter samples top-k 10 at temperature 1, the target
+// samples at the user's settings, so raw p is not an acceptance probability). The expectation over the
+// next position's p' uses the online occupancy of p bins, conditioned on the previous token's p level.
+// --spec-draft-n-min / --spec-draft-n-max stay hard bounds (the floor is at least 1 so every round
+// drafts and accept() timing stays per round). Off unless --spec-draft-n-min > 0; when off nothing below runs.
+//
+//   --spec-draft-n-min N > 0      enable (N and --spec-draft-n-max are the hard bounds)
+//
+// C_j = V(j+1) - V(j) is measured online. V(w) is the verify cost at verify width w (drafted tokens + 1): the wall
+// time from the end of draft() to accept(), i.e. target decode, MTP catch-up decode and sampling. A level term
+// absorbs drift that moves every width alike (context depth, temperature) and restarts fast at each request; the
+// level-detrended samples are kept per width with decay. V is fit non-decreasing in w (pool adjacent violators) on
+// top of a weak linear prior whose slope is learned from the data, and the differences are smoothed and clamped to a
+// small positive minimum. A verify width next to the stopping point that has had almost no recent samples is drafted
+// now and then (results/2026-09-13-mtp-costaware/prs/colmeas/).
+// diagnostics only (environment):
+//   MTPX_COST_STEP_MS=x          fixed s; default: measured online (EMA of draft step wall time)
+//   MTPX_COST_TPT_MS=x           fixed T; default: measured online (EMA of round wall time / tokens)
+//   MTPX_COST_FORCE=rand         ignore costs, draw each round's length uniformly in [n_min, n_max]
+//                                (cost-curve sweep and unbiased calibration capture)
+//   MTPX_COST_LOG=2              print the calibration table with every request summary
+struct mtpx_cost_ctl {
+    bool on         = false;
+    bool force_rand = false;
+    int  log_level  = 1;
 
-    double step_ms = 3.0;  // EMA of the draft step wall time
-    double tpt_ms  = 35.0; // ratio of the two EMAs below (a mean of per-round ratios is biased high)
-    double rnd_ms  = 100.0;
-    double rnd_tok = 100.0 / 35.0;
+    double step_env = -1.0;
+    double tpt_env  = -1.0;
+    double step_ms  = 3.0;  // online EMA
+    double tpt_ms   = 35.0; // online: ratio of the two EMAs below (a mean of per-round ratios is biased high)
+    double rnd_ms   = 100.0;
+    double rnd_tok  = 100.0 / 35.0;
     static constexpr double ema_a = 0.05;
 
-    static constexpr int NPB = 10; // p bins
-    static constexpr int NPC = 4;  // position classes: 1, 2, 3-4, 5+
-    static constexpr int NPV = 4;  // previous token p level: < 0.6, 0.6-0.95, >= 0.95, none (position 1)
+    // p bins: finer where acceptance is decided
+    static constexpr int NPB = 10;
+    static constexpr int NPC = 4; // position classes: 1, 2, 3-4, 5+
+    static constexpr int NPV = 4; // previous-token p level: <0.6, 0.6-0.95, >=0.95, none (position 1)
     static constexpr double cap_n = 4000.0;
 
     double cal_acc[NPC][NPB] = {};
     double cal_n  [NPC][NPB] = {};
     double occ[NPC][NPV][NPB] = {};
 
+    std::mt19937 rng { 12345 };
+
     // per seq
-    std::vector<std::vector<uint8_t>> drafted_pb; // (pc << 4 | bin) per kept token of the last draft
+    std::vector<std::vector<uint8_t>> drafted_pb;  // (pc << 4 | bin) per kept token of the last draft
     std::vector<double>  pchain;
     std::vector<int32_t> prev_lvl;
+    std::vector<int32_t> force_n;
     std::vector<int64_t> t_last_acc;
 
     // verify cost model, indexed by verify width w = 2..W (W = n_max + 1)
@@ -1517,8 +1543,8 @@ struct common_speculative_cost_ctl {
     std::vector<int32_t> v_seen;      // process() calls since the end of the draft
     std::vector<int32_t> explore_pos; // position forced by exploration (0 = none)
 
-    // per request (reset after print)
-    std::vector<uint64_t> hist_req;
+    // per request (reset after print) and lifetime
+    std::vector<uint64_t> hist_req, hist_all;
     uint64_t stop_cap = 0, stop_keep = 0, stop_next = 0;
     uint64_t n_req = 0, tok_acc_req = 0, n_explore_req = 0;
 
@@ -1547,7 +1573,13 @@ struct common_speculative_cost_ctl {
         if (!on) {
             return;
         }
-        // calibration prior: g = p, worth 4 observations per cell
+        const char * e = nullptr;
+        if ((e = getenv("MTPX_COST_STEP_MS")) != nullptr && *e) { step_env = atof(e); }
+        if ((e = getenv("MTPX_COST_TPT_MS"))  != nullptr && *e) { tpt_env  = atof(e); tpt_ms = tpt_env; rnd_tok = rnd_ms / tpt_ms; }
+        if ((e = getenv("MTPX_COST_FORCE"))   != nullptr && strcmp(e, "rand") == 0) { force_rand = true; }
+        if ((e = getenv("MTPX_COST_LOG"))     != nullptr && *e) { log_level = atoi(e); }
+
+        // calibration prior: the drafter is calibrated (g = p), worth 4 observations per cell
         for (int pc = 0; pc < NPC; ++pc) {
             for (int b = 0; b < NPB; ++b) {
                 cal_n[pc][b]   = 4.0;
@@ -1560,8 +1592,10 @@ struct common_speculative_cost_ctl {
         drafted_pb.assign(n_seq, {});
         pchain.assign(n_seq, 1.0);
         prev_lvl.assign(n_seq, NPV - 1);
+        force_n.assign(n_seq, 0);
         t_last_acc.assign(n_seq, 0);
         hist_req.assign((size_t) std::max(1, n_max) + 1, 0);
+        hist_all.assign((size_t) std::max(1, n_max) + 1, 0);
 
         W = std::max(1, n_max) + 1;
         v_s.assign(W + 1, 0.0);
@@ -1577,7 +1611,10 @@ struct common_speculative_cost_ctl {
         explore_pos.assign(n_seq, 0);
         refit();
 
-        LOG_INF("%s", "spec cost-ctl: cost-aware draft length on, verify cost measured online\n");
+        LOG_INF("spec mtpx-cost: cost-aware drafting on: verify cost measured online, step_ms=%s tpt_ms=%s force=%s\n",
+                step_env > 0 ? string_format("%.2f", step_env).c_str() : "online",
+                tpt_env  > 0 ? string_format("%.2f", tpt_env).c_str()  : "online",
+                force_rand ? "rand" : "off");
     }
 
     double col(int j) const { // 1-based position
@@ -1678,14 +1715,17 @@ struct common_speculative_cost_ctl {
     }
 
     bool starved(int w) const {
-        return v_init && w >= 2 && w <= W && v_n[w] < explore_n && rounds - last_explore >= explore_gap;
+        return !force_rand && v_init && w >= 2 && w <= W && v_n[w] < explore_n && rounds - last_explore >= explore_gap;
     }
+    double s() const { return step_env > 0 ? step_env : step_ms; }
+    double T() const { return tpt_env  > 0 ? tpt_env  : tpt_ms;  }
     double g(int j, int b) const {
         const int pc = pc_of(j);
         return cal_acc[pc][b] / cal_n[pc][b];
     }
 
-    // mean acceptance at position j over the p-bin occupancy, for previous p level v (v < 0: all levels)
+    // mean acceptance at position j under the p-bin occupancy of that position class, given the previous
+    // token's p level (v >= 0) or marginal over levels (v < 0)
     double mean_g(int j, int v) const {
         const int pc = pc_of(j);
         double tot = 0.0, sum = 0.0;
@@ -1701,11 +1741,15 @@ struct common_speculative_cost_ctl {
         return tot > 0.0 ? sum / tot : 0.0;
     }
 
-    void draft_begin(llama_seq_id s_id) {
+    // start of a draft for seq
+    void draft_begin(llama_seq_id s_id, int n_lo, int n_hi) {
         pchain[s_id]   = 1.0;
         prev_lvl[s_id] = NPV - 1;
         drafted_pb[s_id].clear();
         explore_pos[s_id] = 0;
+        if (force_rand) {
+            force_n[s_id] = n_hi <= n_lo ? n_lo : std::uniform_int_distribution<int>(n_lo, n_hi)(rng);
+        }
     }
 
     void observe_step_ms(double ms) {
@@ -1714,7 +1758,7 @@ struct common_speculative_cost_ctl {
         }
     }
 
-    // position j (1-based) was sampled with top-1 probability p. returns {keep, draft_next}
+    // position j (1-based) was just sampled with top-1 probability p. returns {keep, draft_next}
     std::pair<bool, bool> decide(llama_seq_id s_id, int j, double p, int n_lo, int n_hi) {
         const int b  = bin_of(p);
         const int pc = pc_of(j);
@@ -1731,39 +1775,45 @@ struct common_speculative_cost_ctl {
             occ[pc][prev_lvl[s_id]][b] += 1.0;
         }
 
-        const double T  = tpt_ms;
-        const double s  = step_ms;
         const double pj = pchain[s_id] * g(j, b);
-
         const bool forced = explore_pos[s_id] == j;
-        bool keep = forced || j <= n_lo || pj * T >= col(j);
-        bool next = false;
-        if (keep && j < n_hi) {
-            if (j < n_lo) {
-                next = true;
-            } else {
-                // one-step lookahead over the p distribution of the next position
-                const int pc1 = pc_of(j + 1);
-                const int v1  = lvl_of(p);
-                double tot = 0.0, gain = 0.0;
-                for (int k = 0; k < NPB; ++k) {
-                    const double w = occ[pc1][v1][k];
-                    tot  += w;
-                    gain += w * std::max(0.0, pj * g(j + 1, k) * T - col(j + 1));
-                }
-                next = tot > 0.0 && gain / tot >= s;
-                // column cost is not monotone in width, so also try a deeper path with the mean acceptance
-                if (!next) {
-                    double P = pj, net = 0.0;
-                    for (int m = 1; j + m <= n_hi; ++m) {
-                        P   *= mean_g(j + m, m == 1 ? v1 : -1);
-                        net += P * T - col(j + m) - s;
-                        if (net >= 0.0) {
-                            next = true;
-                            break;
-                        }
-                        if (P * T < 0.5) {
-                            break;
+        bool keep;
+        bool next;
+        if (force_rand) {
+            keep = j <= force_n[s_id];
+            next = keep && j < force_n[s_id];
+        } else {
+            keep = forced || j <= n_lo || pj * T() >= col(j);
+            next = false;
+            if (keep && j < n_hi) {
+                if (j < n_lo) {
+                    next = true;
+                } else {
+                    // one-step lookahead over the next position's p distribution (it can still be trimmed)
+                    const int pc1 = pc_of(j + 1);
+                    const int v1  = lvl_of(p);
+                    double tot = 0.0, gain = 0.0;
+                    for (int k = 0; k < NPB; ++k) {
+                        const double w = occ[pc1][v1][k];
+                        tot  += w;
+                        gain += w * std::max(0.0, pj * g(j + 1, k) * T() - col(j + 1));
+                    }
+                    next = tot > 0.0 && gain / tot >= s();
+                    // deeper horizon: column cost is not monotone in width (widths >= 9 leave MMVQ for the flat
+                    // MMQ tile and measured ~1.3 ms/col against ~4-5 below), so a one-step stop can be wrong
+                    // for m steps. Expected-value path with the mean acceptance per position.
+                    if (!next) {
+                        double P = pj, net = 0.0;
+                        for (int m = 1; j + m <= n_hi; ++m) {
+                            P   *= mean_g(j + m, m == 1 ? v1 : -1);
+                            net += P * T() - col(j + m) - s();
+                            if (net >= 0.0) {
+                                next = true;
+                                break;
+                            }
+                            if (P * T() < 0.5) {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1799,6 +1849,7 @@ struct common_speculative_cost_ctl {
 
     void draft_end(llama_seq_id s_id, size_t n_result) {
         hist_req[std::min(n_result, hist_req.size() - 1)]++;
+        hist_all[std::min(n_result, hist_all.size() - 1)]++;
         drafted_pb[s_id].resize(std::min(drafted_pb[s_id].size(), n_result));
         rounds++;
         v_seen[s_id]      = 0;
@@ -1811,10 +1862,10 @@ struct common_speculative_cost_ctl {
             const int pc = d[j] >> 4;
             const int b  = d[j] & 0xf;
             if (cal_n[pc][b] > cap_n) {
-                cal_n[pc][b]   *= 0.5;
+                cal_n[pc][b] *= 0.5;
                 cal_acc[pc][b] *= 0.5;
             }
-            cal_n[pc][b]   += 1.0;
+            cal_n[pc][b] += 1.0;
             cal_acc[pc][b] += j < n_accepted ? 1.0 : 0.0;
         }
         d.clear();
@@ -1839,7 +1890,7 @@ struct common_speculative_cost_ctl {
 
     void begin(llama_seq_id s_id) {
         if (s_id >= 0 && (size_t) s_id < t_last_acc.size()) {
-            t_last_acc[s_id]  = 0; // the gap before the first round is prefill, not a round
+            t_last_acc[s_id]  = 0; // the gap before this request's first round is prefill, not a round
             t_draft_end[s_id] = 0;
             v_fast = v_fast_n;     // the context depth changed: let the verify level catch up
         }
@@ -1857,25 +1908,29 @@ struct common_speculative_cost_ctl {
             h   += string_format("%s%zu:%llu", h.empty() ? "" : " ", k, (unsigned long long) hist_req[k]);
         }
         n_req++;
-        LOG_INF("spec cost-ctl: req %llu rounds=%llu mean_len=%.3f mlen=%.3f hist[%s] stops(cap/keep/next)=%llu/%llu/%llu T=%.2fms s=%.2fms\n",
+        LOG_INF("spec mtpx-cost: req %llu rounds=%llu mean_len=%.3f mlen=%.3f hist[%s] stops(cap/keep/next)=%llu/%llu/%llu T=%.2fms s=%.2fms\n",
                 (unsigned long long) n_req, (unsigned long long) n, n ? (double) sum / n : 0.0,
                 n ? 1.0 + (double) tok_acc_req / n : 0.0, h.c_str(),
-                (unsigned long long) stop_cap, (unsigned long long) stop_keep, (unsigned long long) stop_next, tpt_ms, step_ms);
-        std::string vs, cs;
-        for (int w = 2; w <= W; ++w) {
-            vs += string_format(" %d:%.1f/%.0f", w, v_lvl + v_fit[w], v_n[w]);
-        }
-        for (int j = 1; j < W; ++j) {
-            cs += string_format(" %.2f", c_fit[j]);
-        }
-        LOG_INF("spec cost-ctl: verify ms/n by width [%s] column ms by position [%s] explore=%llu\n",
-                vs.c_str(), cs.c_str(), (unsigned long long) n_explore_req);
-        for (int pc = 0; pc < NPC; ++pc) {
-            std::string row;
-            for (int b = 0; b < NPB; ++b) {
-                row += string_format(" %.3f/%.0f", g(pc == 0 ? 1 : pc == 1 ? 2 : pc == 2 ? 3 : 5, b), cal_n[pc][b] - 4.0);
+                (unsigned long long) stop_cap, (unsigned long long) stop_keep, (unsigned long long) stop_next, T(), s());
+        {
+            std::string vs, cs;
+            for (int w = 2; w <= W; ++w) {
+                vs += string_format(" %d:%.1f/%.0f", w, v_lvl + v_fit[w], v_n[w]);
             }
-            LOG_DBG("spec cost-ctl: cal pos-class %d (g/n per p-bin <.3 <.5 <.6 <.7 <.8 <.9 <.95 <.98 <.995 rest):%s\n", pc, row.c_str());
+            for (int j = 1; j < W; ++j) {
+                cs += string_format(" %.2f", c_fit[j]);
+            }
+            LOG_INF("spec mtpx-cost: verify ms/n by width [%s] column ms by position [%s] explore=%llu\n",
+                    vs.c_str(), cs.c_str(), (unsigned long long) n_explore_req);
+        }
+        if (log_level >= 2 || n_req % 20 == 1) {
+            for (int pc = 0; pc < NPC; ++pc) {
+                std::string row;
+                for (int b = 0; b < NPB; ++b) {
+                    row += string_format(" %.3f/%.0f", g(pc == 0 ? 1 : pc == 1 ? 2 : pc == 2 ? 3 : 5, b), cal_n[pc][b] - 4.0);
+                }
+                LOG_INF("spec mtpx-cost: cal pos-class %d (g/n per p-bin <.3 <.5 <.6 <.7 <.8 <.9 <.95 <.98 <.995 rest):%s\n", pc, row.c_str());
+            }
         }
         std::fill(hist_req.begin(), hist_req.end(), 0);
         stop_cap = stop_keep = stop_next = 0;
@@ -1919,7 +1974,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
-    common_speculative_cost_ctl cost; // on when --spec-draft-n-min > 0
+    // MTPX_DEFER_CATCHUP=1 (results/2026-09-12-mtp-opt/): process() does not decode the verified batch
+    // through the MTP head. Its rows are kept here, accept() drops the rejected ones, and the accepted
+    // ones are prepended to the first draft step's batch -- one ctx_dft decode (plus the rejected rows'
+    // work) disappears per round. Single-head, own-KV mode only (qwen35 / qwen35moe).
+    bool defer_catchup = false;
+    struct dfr_row {
+        llama_token tok;
+        llama_pos   pos;
+    };
+    std::vector<std::vector<dfr_row>> dfr_rows;    // [n_seq] rows not yet in ctx_dft's KV, ascending pos
+    std::vector<std::vector<float>>   dfr_h;       // [n_seq] their h inputs, n_embd floats per row
+    std::vector<llama_pos>            dfr_last_p0; // [n_seq] first pos of the most recent deferred batch, -1 none
+    int32_t dfr_n_dropped = 0;
+
+    mtpx_cost_ctl cost; // on when --spec-draft-n-min > 0, see above
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -2001,14 +2070,94 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
 
-        const bool cost_ok = !chain_heads && !is_mem_shared;
-        if (this->params.n_min > 0 && !cost_ok) {
-            SPC_WRN("%s", "cost-aware draft length (--spec-draft-n-min > 0) is only supported for single-head MTP with its own KV cache\n");
+        {
+            const char * e = getenv("MTPX_DEFER_CATCHUP");
+            defer_catchup = e != nullptr && atoi(e) != 0 && !is_mem_shared && !chain_heads;
         }
-        cost.init(n_seq, this->params.n_max, this->params.n_min > 0 && cost_ok);
+        dfr_rows.assign(n_seq, {});
+        dfr_h.assign(n_seq, {});
+        dfr_last_p0.assign(n_seq, -1);
+        if (defer_catchup) {
+            SPC_WRN("MTPX_DEFER_CATCHUP=%d: catch-up rows are merged into the first draft step\n", 1);
+        }
+
+        cost.init(n_seq, this->params.n_max, this->params.n_min > 0);
+        // backend draft sampling is fine: the backend chain is top-k only, so the CPU chain still runs over its
+        // candidates and cur_p carries the top-k renormalised probabilities (common/sampling.cpp set_logits)
+        if (cost.on && (chain_heads || is_mem_shared)) {
+            SPC_WRN("%s", "cost-aware draft length (--spec-draft-n-min > 0) not available: only the single-head own-KV MTP path is supported\n");
+            cost.on = false;
+        }
         if (cost.on && adaptive_n) {
             SPC_WRN("%s", "cost-aware draft length (--spec-draft-n-min > 0) overrides --spec-draft-adaptive\n");
         }
+    }
+
+    // drop deferred rows of seq s at positions >= p
+    void dfr_trim(llama_seq_id s, llama_pos p) {
+        auto & rows = dfr_rows[s];
+        size_t keep = 0;
+        while (keep < rows.size() && rows[keep].pos < p) {
+            keep++;
+        }
+        rows.resize(keep);
+        dfr_h[s].resize(keep * (size_t) n_embd);
+    }
+
+    // deferred rows must extend ctx_dft's KV exactly and be consecutive; anything else is stale
+    // (a server path this lever does not model) and is dropped rather than decoded out of order
+    bool dfr_valid(llama_seq_id s) {
+        auto & rows = dfr_rows[s];
+        if (rows.empty()) {
+            return true;
+        }
+        const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), s);
+        bool ok = rows[0].pos == pmax + 1;
+        for (size_t r = 1; ok && r < rows.size(); ++r) {
+            ok = rows[r].pos == rows[r - 1].pos + 1;
+        }
+        if (!ok) {
+            if (dfr_n_dropped++ < 8) {
+                SPC_WRN("MTPX: dropping %zu stale deferred rows for seq %d (first pos %d, ctx_dft pos_max %d)\n",
+                        rows.size(), (int) s, (int) rows[0].pos, (int) pmax);
+            }
+            rows.clear();
+            dfr_h[s].clear();
+        }
+        return ok;
+    }
+
+    // append seq s's deferred rows to `batch` (no outputs) and forget them
+    void dfr_emit(llama_seq_id s) {
+        auto & rows = dfr_rows[s];
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        for (size_t r = 0; r < rows.size(); ++r) {
+            common_batch_add(batch, rows[r].tok, rows[r].pos, { s }, false);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, dfr_h[s].data() + r * n_embd, row_bytes);
+        }
+        rows.clear();
+        dfr_h[s].clear();
+    }
+
+    // decode all deferred rows on their own, ahead of a batch that cannot carry them
+    bool dfr_flush() {
+        common_batch_clear(batch);
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            if (dfr_valid(s)) {
+                dfr_emit(s);
+            }
+        }
+        if (batch.n_tokens == 0) {
+            return true;
+        }
+        common_mtpx_mark("f0", batch.n_tokens);
+        const int32_t rc = llama_decode(params.ctx_dft, batch);
+        common_mtpx_mark("f1", rc);
+        if (rc != 0) {
+            SPC_ERR("llama_decode(ctx_dft) flush of deferred rows failed rc=%d\n", (int) rc);
+            return false;
+        }
+        return true;
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -2043,7 +2192,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto * ctx_dft = this->params.ctx_dft;
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        if (defer_catchup && !dfr_rows[seq_id].empty()) {
+            pos_max = std::max(pos_max, dfr_rows[seq_id].back().pos);
+        }
 
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
@@ -2088,8 +2240,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        bool verify_sized = false;
+        if (defer_catchup) {
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (i_batch_beg[s] < 0) {
+                    continue;
+                }
+                const llama_pos p0 = batch_in.pos[i_batch_beg[s]];
+                // re-verification of positions still held here (checkpoint restore + replay): the row
+                // at p0 carries the h that pairs with it (the baseline pairs it with a stale pending_h)
+                for (size_t r = 0; r < dfr_rows[s].size(); ++r) {
+                    if (dfr_rows[s][r].pos == p0) {
+                        std::memcpy(pending_h[s].data(), dfr_h[s].data() + r * n_embd, row_bytes);
+                        break;
+                    }
+                }
+                dfr_trim(s, p0);
+            }
+
+            verify_sized = n_tokens <= std::max(1, (int) this->params.n_max) + 1;
+            if (verify_sized) {
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id s = batch_in.seq_id[k][0];
+                    const float * h = (k == i_batch_beg[s]) ? pending_h[s].data() : h_tgt + (size_t) (k - 1) * n_embd;
+                    dfr_rows[s].push_back({ batch_in.token[k], batch_in.pos[k] });
+                    dfr_h[s].insert(dfr_h[s].end(), h, h + n_embd);
+                }
+                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                    if (i_batch_beg[s] >= 0) {
+                        dfr_last_p0[s] = batch_in.pos[i_batch_beg[s]];
+                    }
+                }
+            } else {
+                if (!dfr_flush()) {
+                    return false;
+                }
+                std::fill(dfr_last_p0.begin(), dfr_last_p0.end(), -1);
+            }
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (!is_mem_shared && !(defer_catchup && verify_sized)) {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -2134,7 +2326,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                common_mtpx_mark("c0", batch.n_tokens);
                 const int32_t rc = llama_decode(ctx_dft, batch);
+                common_mtpx_mark("c1", rc);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -2206,7 +2400,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (cost.on) {
                 cost_hi[seq_id] = std::max(1, dp.n_max > 0 ? std::min((int) params.n_max, (int) dp.n_max) : (int) params.n_max);
                 cost_lo[seq_id] = std::min(std::max(1, (int) params.n_min), cost_hi[seq_id]);
-                cost.draft_begin(seq_id);
+                cost.draft_begin(seq_id, cost_lo[seq_id], cost_hi[seq_id]);
+            }
+
+            if (defer_catchup) {
+                dfr_trim(seq_id, dp.pos0); // committed rows only (accept() already cut the rejected ones)
+                if (dfr_valid(seq_id)) {
+                    dfr_emit(seq_id);
+                }
             }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
@@ -2239,7 +2440,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int64_t t_step0 = cost.on ? ggml_time_us() : 0;
+            common_mtpx_mark("d0", i, batch.n_tokens);
             int ret = llama_decode(ctx_dft, batch);
+            common_mtpx_mark("d1", ret);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
@@ -2262,6 +2465,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const int32_t n_draft_eff = cost.on ? 0 : adaptive_n_draft(seq_id, params.n_max, params.n_min);
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                common_mtpx_mark("d2", i);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -2374,6 +2578,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (cost.on) {
             cost.accepted(seq_id, n_accepted);
+        }
+
+        if (defer_catchup && dfr_last_p0[seq_id] >= 0) {
+            // rows of the last verified batch past the accepted prefix were rejected drafts
+            dfr_trim(seq_id, dfr_last_p0[seq_id] + (llama_pos) n_accepted + 1);
+            dfr_last_p0[seq_id] = -1;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];

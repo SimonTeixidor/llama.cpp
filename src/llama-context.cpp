@@ -1473,7 +1473,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // LLAMA_GRAPH_TIMING=1: log where the CPU time of a decode goes (build, alloc, inputs)
     static const bool graph_timing = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")) != 0;
-    int64_t t_build = 0, t_alloc = 0, t_inputs = 0;
+    int64_t t_build = 0, t_alloc = 0, t_inputs = 0, t_sync = 0;
     bool reused = false;
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
@@ -1485,7 +1485,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
     } else {
         // The previous asynchronous graph may still use allocations that reset releases.
+        const auto t_sync_us = ggml_time_us();
         ggml_backend_sched_synchronize(sched.get());
+        t_sync = ggml_time_us() - t_sync_us;
 
         res->reset();
 
@@ -1522,9 +1524,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         t_inputs = ggml_time_us() - t_inputs_us;
         if (graph_timing) {
-            LLAMA_LOG_WARN("graph-timing: n_tokens=%3u gtype=%d reused=%d build=%.2f alloc=%.2f inputs=%.2f ms nodes=%d\n",
+            LLAMA_LOG_WARN("graph-timing: n_tokens=%3u gtype=%d reused=%d build=%.2f alloc=%.2f inputs=%.2f ms nodes=%d sync=%.2f ctx=%p t=%lld\n",
                            ubatch.n_tokens, (int) gtype, (int) reused, t_build/1000.0, t_alloc/1000.0, t_inputs/1000.0,
-                           ggml_graph_n_nodes(res->get_gf()));
+                           ggml_graph_n_nodes(res->get_gf()), t_sync/1000.0, (void *) this, (long long) ggml_time_us());
         }
     }
 

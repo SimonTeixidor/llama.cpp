@@ -2583,8 +2583,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    // nodes[0] alone collides for graphs that share one meta arena (different topologies, or one topology at varying batch width).
-    // Mix in the node count, the last node and the shapes of three nodes. A hash collision only resets warmup, the node properties are still checked.
+    // Shape-aware graph-cache key (from wip/dflash-opt 0a70801b1 + 5543ce216; results/2026-09-12-dflash-opt/):
+    // keying by nodes[0] alone means a context that alternates topologies
+    // sharing one compute-meta arena, or one topology at varying width (--spec-draft-adaptive changes the
+    // verify width every round), finds the previous graph's properties under its key, resets warmup and
+    // runs without a graph forever. Fold node count, last node and three probe nodes' ne into the key so
+    // each (topology, width) gets its own entry. The key is only ever used as a map key.
     if (cgraph->n_nodes > 0) {
         uintptr_t k = (uintptr_t) cgraph->nodes[0];
         k ^= (uintptr_t) cgraph->nodes[cgraph->n_nodes - 1] * (uintptr_t) 0x9E3779B97F4A7C15ull;
@@ -2595,6 +2599,9 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
             cgraph->nodes[cgraph->n_nodes - 1],
         };
         for (int i = 0; i < 3; ++i) {
+            if (!probe[i]) {
+                continue;
+            }
             for (int d = 0; d < GGML_MAX_DIMS; ++d) {
                 k = (k ^ (uintptr_t) probe[i]->ne[d]) * (uintptr_t) 0x100000001B3ull;
             }
@@ -5446,6 +5453,172 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+#ifdef GGML_USE_HIP
+#include <hip/hip_ext.h>   // hipExtLaunchKernelGGL
+
+// Step fence — the true GPU-domain span of one compute call.
+//
+// rocprofiler's KERNEL_DISPATCH timestamps are unusable on this machine: hsa_amd_profiling_get_
+// dispatch_time hands back a start of 0 and the tool silently substitutes the host enqueue time
+// for both ends, so every kernel reads as zero-length. The dispatch packet's own timestamps are
+// fine, and hipExtLaunchKernelGGL is what exposes them. Bracketing the step with two no-op
+// kernels launched that way gives leading-start .. trailing-stop = the span the GPU actually
+// spent on this step. Subtracting that from the wall time per token is the idle/launch overhead.
+// See results/2026-09-10-profile-step/TIMESTAMPS.md for why every other instrument was rejected.
+//
+// Off unless GGML_CUDA_STEP_FENCE=1, and costs nothing when off. Two extra no-op dispatches per
+// step when on; it does not serialise the queue and it works with HIP graphs enabled.
+
+static __global__ void ggml_cuda_step_fence_nop() { }
+
+struct ggml_cuda_step_fence {
+    // Deep enough that a slot's events are long complete before it is reused, so reading them
+    // never stalls the queue.
+    static constexpr int NSLOTS = 8;
+
+    // GGML_CUDA_STEP_FENCE=2 (results/2026-09-12-mtp-opt/): each record also carries the host
+    // submit window (h0/h1, ggml_time_us), which backend context ran it, its node count, whether it
+    // was a HIP-graph replay (flags&1) or a capture (flags&2), and its GPU-clock position (g0/g1)
+    // relative to an epoch reference dispatch. Epochs roll every EPOCH_STEPS steps so the float
+    // milliseconds of hipEventElapsedTime keep microsecond resolution; each new epoch prints its
+    // offset from the previous one. Level 2 also fences capture steps: the leading fence goes in
+    // before cudaStreamBeginCapture and the trailing one after the graph launch, so nothing is
+    // captured and the span includes the host capture/instantiate time.
+    static constexpr int NREF        = 4;
+    static constexpr int EPOCH_STEPS = 128;
+
+    cudaEvent_t lead_start[NSLOTS] = {};
+    cudaEvent_t lead_stop [NSLOTS] = {};
+    cudaEvent_t trail_start[NSLOTS] = {};
+    cudaEvent_t trail_stop [NSLOTS] = {};
+    bool    pending[NSLOTS] = {};
+    int     slot_step[NSLOTS] = {};
+    int64_t slot_h0[NSLOTS] = {};
+    int64_t slot_h1[NSLOTS] = {};
+    int     slot_ctx[NSLOTS] = {};
+    int     slot_nodes[NSLOTS] = {};
+    int     slot_flags[NSLOTS] = {};
+    int     slot_epoch[NSLOTS] = {};
+    cudaEvent_t ref_start[NREF] = {};
+    cudaEvent_t ref_stop [NREF] = {};
+    int   epoch = -1;
+    int   epoch_reported = 0;
+    int   slot = 0;
+    int   step = 0;
+    std::unordered_map<const void *, int> ctx_ids;
+
+    static int level() {
+        static const int l = getenv("GGML_CUDA_STEP_FENCE") != nullptr ? atoi(getenv("GGML_CUDA_STEP_FENCE")) : 0;
+        return l;
+    }
+
+    static bool enabled() {
+        return level() != 0;
+    }
+
+    int ctx_id(const void * p) {
+        auto it = ctx_ids.find(p);
+        if (it == ctx_ids.end()) {
+            it = ctx_ids.emplace(p, (int) ctx_ids.size()).first;
+        }
+        return it->second;
+    }
+
+    void init() {
+        for (int i = 0; i < NSLOTS; ++i) {
+            CUDA_CHECK(hipEventCreate(&lead_start[i]));
+            CUDA_CHECK(hipEventCreate(&lead_stop[i]));
+            CUDA_CHECK(hipEventCreate(&trail_start[i]));
+            CUDA_CHECK(hipEventCreate(&trail_stop[i]));
+        }
+        for (int i = 0; i < NREF; ++i) {
+            CUDA_CHECK(hipEventCreate(&ref_start[i]));
+            CUDA_CHECK(hipEventCreate(&ref_stop[i]));
+        }
+    }
+
+    // Drain the slot we are about to overwrite, reporting the step it belonged to.
+    void drain(int i) {
+        if (!pending[i]) {
+            return;
+        }
+        CUDA_CHECK(cudaEventSynchronize(trail_stop[i]));
+        float span_ms = -1.0f;
+        CUDA_CHECK(hipEventElapsedTime(&span_ms, lead_start[i], trail_stop[i]));
+        if (level() >= 2) {
+            const int e = slot_epoch[i];
+            while (epoch_reported < e) {
+                const int a = epoch_reported % NREF;
+                const int b = (epoch_reported + 1) % NREF;
+                CUDA_CHECK(cudaEventSynchronize(ref_stop[b]));
+                float d_ms = -1.0f;
+                CUDA_CHECK(hipEventElapsedTime(&d_ms, ref_start[a], ref_start[b]));
+                fprintf(stderr, "STEP_FENCE_EPOCH e=%d from_prev_us=%.3f\n", epoch_reported + 1, d_ms * 1e3f);
+                epoch_reported++;
+            }
+            float g0 = -1.0f;
+            float g1 = -1.0f;
+            CUDA_CHECK(hipEventElapsedTime(&g0, ref_start[e % NREF], lead_start[i]));
+            CUDA_CHECK(hipEventElapsedTime(&g1, ref_start[e % NREF], trail_stop[i]));
+            fprintf(stderr, "STEP_FENCE step=%d gpu_span_us=%.3f ctx=%d nodes=%d flags=%d e=%d g0_us=%.3f g1_us=%.3f h0=%lld h1=%lld\n",
+                    slot_step[i], span_ms * 1e3f, slot_ctx[i], slot_nodes[i], slot_flags[i], e, g0 * 1e3f, g1 * 1e3f,
+                    (long long) slot_h0[i], (long long) slot_h1[i]);
+        } else {
+            fprintf(stderr, "STEP_FENCE step=%d gpu_span_us=%.3f\n", slot_step[i], span_ms * 1e3f);
+        }
+        pending[i] = false;
+    }
+
+    void begin(cudaStream_t stream, const void * ctx = nullptr, int n_nodes = 0, int flags = 0) {
+        static bool initialised = false;
+        if (!initialised) {
+            init();
+            initialised = true;
+        }
+        drain(slot);
+        slot_h0[slot] = ggml_time_us();
+        if (level() >= 2 && step / EPOCH_STEPS != epoch) {
+            // a new epoch: its reference dispatch goes in ahead of this step's leading fence
+            epoch = step / EPOCH_STEPS;
+            hipExtLaunchKernelGGL(ggml_cuda_step_fence_nop, dim3(1), dim3(64), 0,
+                                  stream, ref_start[epoch % NREF], ref_stop[epoch % NREF], 0);
+        }
+        slot_epoch[slot] = epoch;
+        slot_ctx[slot]   = ctx_id(ctx);
+        slot_nodes[slot] = n_nodes;
+        slot_flags[slot] = flags;
+        hipExtLaunchKernelGGL(ggml_cuda_step_fence_nop, dim3(1), dim3(64), 0,
+                              stream, lead_start[slot], lead_stop[slot], 0);
+    }
+
+    void end(cudaStream_t stream) {
+        hipExtLaunchKernelGGL(ggml_cuda_step_fence_nop, dim3(1), dim3(64), 0,
+                              stream, trail_start[slot], trail_stop[slot], 0);
+        slot_h1[slot]    = ggml_time_us();
+        pending[slot]    = true;
+        slot_step[slot]  = step;
+        slot = (slot + 1) % NSLOTS;
+        step++;
+    }
+
+    // Report the slots still in flight. Called once the run is over.
+    void flush() {
+        for (int i = 0; i < NSLOTS; ++i) {
+            drain((slot + i) % NSLOTS);
+        }
+    }
+};
+#endif // GGML_USE_HIP
+
+// GGML_CUDA_GRAPH_MIN_STABLE=N (results/2026-09-12-mtp-opt/): consecutive calls with unchanged
+// graph properties required before a HIP/CUDA graph is captured. Default 1 = upstream behaviour
+// (capture on the second call). A context alternating between two graph shapes (the MTP draft
+// context: catch-up, draft step, draft step) otherwise captures and discards a graph every round.
+[[maybe_unused]] static int ggml_cuda_graph_min_stable() {
+    static const int n = getenv("GGML_CUDA_GRAPH_MIN_STABLE") != nullptr ? std::max(1, atoi(getenv("GGML_CUDA_GRAPH_MIN_STABLE"))) : 1;
+    return n;
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -5468,11 +5641,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
+                // (GGML_CUDA_GRAPH_MIN_STABLE=N: N consecutive unchanged calls; default 1)
                 if (!properties_changed) {
-                    graph->warmup_complete = true;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
-                    use_cuda_graph = true;
-                    cuda_graph_update_required = true;
+                    if (++graph->n_stable >= ggml_cuda_graph_min_stable()) {
+                        graph->warmup_complete = true;
+                        GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                    }
+                } else {
+                    graph->n_stable = 0;
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
@@ -5480,6 +5658,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    graph->n_stable = 0;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
@@ -5489,6 +5668,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+#ifdef GGML_USE_HIP
+    // A capture step enqueues nothing, so there is no span to measure and a fence launched here
+    // would be captured into the graph itself. Skip those; they are the warmup steps anyway.
+    static ggml_cuda_step_fence fence;
+    // Level 2 fences capture steps too (the leading fence is enqueued before the capture begins).
+    const bool fence_this_step = ggml_cuda_step_fence::enabled() &&
+                                 (ggml_cuda_step_fence::level() >= 2 || !(use_cuda_graph && cuda_graph_update_required));
+    if (fence_this_step) {
+        fence.begin(cuda_ctx->stream(), cuda_ctx, cgraph->n_nodes,
+                    (use_cuda_graph ? 1 : 0) | (cuda_graph_update_required ? 2 : 0));
+    }
+#endif // GGML_USE_HIP
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -5501,6 +5693,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+#ifdef GGML_USE_HIP
+    if (fence_this_step) {
+        fence.end(cuda_ctx->stream());
+    }
+#endif // GGML_USE_HIP
 
     return GGML_STATUS_SUCCESS;
 }
