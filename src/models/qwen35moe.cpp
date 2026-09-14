@@ -414,7 +414,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    // allow_inplace: in the common (no seq_cp) case this is a view of the cache slot rather than a
+    // get_rows copy; the Vulkan backend then runs gated_delta_net in place on the cache (GDN_STATE_CPY).
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, ggml_get_rows, /*allow_inplace=*/true);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -483,8 +485,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // 2-D, not [d, n_seq_tokens, n_seqs]: the projection below is immediately flattened to
+    // [n_embd, n_seq_tokens*n_seqs] anyway, and a 3-D src1 makes the mul_mat n_seqs separate
+    // ne11 = n_seq_tokens matmuls that each re-read the whole ssm_out weight.
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
     // Output projection
@@ -739,7 +743,17 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (model.mtp_draft_head != nullptr && head_w == model.output && n_outputs == 1) {
+        // draft over a row subset of the LM head: scatter its logits into a full-vocab row of -inf
+        const int64_t n_sel = model.mtp_draft_head->ne[1];
+        const int64_t n_row = model.output->ne[1];
+        ggml_tensor * sub = build_lora_mm(model.mtp_draft_head, cur, head_s);
+        cur = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_row), -INFINITY);
+        cur = ggml_set_rows(ctx0, cur, ggml_reshape_2d(ctx0, sub, 1, n_sel), model.mtp_draft_ids);
+        cur = ggml_reshape_2d(ctx0, cur, n_row, 1);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
