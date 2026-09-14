@@ -1143,6 +1143,11 @@ void launch_fattn(
             if (amd_wmma_available(cc) && DKQ == 64) {
                 return true; // TODO better configuration
             }
+            // RDNA3.5 (gfx1151): keep stream_k for every head size, as before the gfx1201 tuning. At ub 1024 and a
+            // 32k KV cache, whole-tile grids cost ~5 % of qwen35moe prefill.
+            if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+                return true;
+            }
             return tiles_efficiency_percent < 75;
         };
 
