@@ -1974,20 +1974,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
-    // MTPX_DEFER_CATCHUP=1 (results/2026-09-12-mtp-opt/): process() does not decode the verified batch
-    // through the MTP head. Its rows are kept here, accept() drops the rejected ones, and the accepted
-    // ones are prepended to the first draft step's batch -- one ctx_dft decode (plus the rejected rows'
-    // work) disappears per round. Single-head, own-KV mode only (qwen35 / qwen35moe).
-    bool defer_catchup = false;
-    struct dfr_row {
-        llama_token tok;
-        llama_pos   pos;
-    };
-    std::vector<std::vector<dfr_row>> dfr_rows;    // [n_seq] rows not yet in ctx_dft's KV, ascending pos
-    std::vector<std::vector<float>>   dfr_h;       // [n_seq] their h inputs, n_embd floats per row
-    std::vector<llama_pos>            dfr_last_p0; // [n_seq] first pos of the most recent deferred batch, -1 none
-    int32_t dfr_n_dropped = 0;
-
     mtpx_cost_ctl cost; // on when --spec-draft-n-min > 0, see above
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
@@ -2070,17 +2056,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
 
-        {
-            const char * e = getenv("MTPX_DEFER_CATCHUP");
-            defer_catchup = e != nullptr && atoi(e) != 0 && !is_mem_shared && !chain_heads;
-        }
-        dfr_rows.assign(n_seq, {});
-        dfr_h.assign(n_seq, {});
-        dfr_last_p0.assign(n_seq, -1);
-        if (defer_catchup) {
-            SPC_WRN("MTPX_DEFER_CATCHUP=%d: catch-up rows are merged into the first draft step\n", 1);
-        }
-
         cost.init(n_seq, this->params.n_max, this->params.n_min > 0);
         // backend draft sampling is fine: the backend chain is top-k only, so the CPU chain still runs over its
         // candidates and cur_p carries the top-k renormalised probabilities (common/sampling.cpp set_logits)
@@ -2091,73 +2066,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (cost.on && adaptive_n) {
             SPC_WRN("%s", "cost-aware draft length (--spec-draft-n-min > 0) overrides --spec-draft-adaptive\n");
         }
-    }
-
-    // drop deferred rows of seq s at positions >= p
-    void dfr_trim(llama_seq_id s, llama_pos p) {
-        auto & rows = dfr_rows[s];
-        size_t keep = 0;
-        while (keep < rows.size() && rows[keep].pos < p) {
-            keep++;
-        }
-        rows.resize(keep);
-        dfr_h[s].resize(keep * (size_t) n_embd);
-    }
-
-    // deferred rows must extend ctx_dft's KV exactly and be consecutive; anything else is stale
-    // (a server path this lever does not model) and is dropped rather than decoded out of order
-    bool dfr_valid(llama_seq_id s) {
-        auto & rows = dfr_rows[s];
-        if (rows.empty()) {
-            return true;
-        }
-        const llama_pos pmax = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), s);
-        bool ok = rows[0].pos == pmax + 1;
-        for (size_t r = 1; ok && r < rows.size(); ++r) {
-            ok = rows[r].pos == rows[r - 1].pos + 1;
-        }
-        if (!ok) {
-            if (dfr_n_dropped++ < 8) {
-                SPC_WRN("MTPX: dropping %zu stale deferred rows for seq %d (first pos %d, ctx_dft pos_max %d)\n",
-                        rows.size(), (int) s, (int) rows[0].pos, (int) pmax);
-            }
-            rows.clear();
-            dfr_h[s].clear();
-        }
-        return ok;
-    }
-
-    // append seq s's deferred rows to `batch` (no outputs) and forget them
-    void dfr_emit(llama_seq_id s) {
-        auto & rows = dfr_rows[s];
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        for (size_t r = 0; r < rows.size(); ++r) {
-            common_batch_add(batch, rows[r].tok, rows[r].pos, { s }, false);
-            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, dfr_h[s].data() + r * n_embd, row_bytes);
-        }
-        rows.clear();
-        dfr_h[s].clear();
-    }
-
-    // decode all deferred rows on their own, ahead of a batch that cannot carry them
-    bool dfr_flush() {
-        common_batch_clear(batch);
-        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
-            if (dfr_valid(s)) {
-                dfr_emit(s);
-            }
-        }
-        if (batch.n_tokens == 0) {
-            return true;
-        }
-        common_mtpx_mark("f0", batch.n_tokens);
-        const int32_t rc = llama_decode(params.ctx_dft, batch);
-        common_mtpx_mark("f1", rc);
-        if (rc != 0) {
-            SPC_ERR("llama_decode(ctx_dft) flush of deferred rows failed rc=%d\n", (int) rc);
-            return false;
-        }
-        return true;
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -2193,9 +2101,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_dft = this->params.ctx_dft;
         llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
-        if (defer_catchup && !dfr_rows[seq_id].empty()) {
-            pos_max = std::max(pos_max, dfr_rows[seq_id].back().pos);
-        }
 
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
@@ -2240,48 +2145,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
-        bool verify_sized = false;
-        if (defer_catchup) {
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
-                if (i_batch_beg[s] < 0) {
-                    continue;
-                }
-                const llama_pos p0 = batch_in.pos[i_batch_beg[s]];
-                // re-verification of positions still held here (checkpoint restore + replay): the row
-                // at p0 carries the h that pairs with it (the baseline pairs it with a stale pending_h)
-                for (size_t r = 0; r < dfr_rows[s].size(); ++r) {
-                    if (dfr_rows[s][r].pos == p0) {
-                        std::memcpy(pending_h[s].data(), dfr_h[s].data() + r * n_embd, row_bytes);
-                        break;
-                    }
-                }
-                dfr_trim(s, p0);
-            }
-
-            verify_sized = n_tokens <= std::max(1, (int) this->params.n_max) + 1;
-            if (verify_sized) {
-                for (int k = 0; k < n_tokens; ++k) {
-                    const llama_seq_id s = batch_in.seq_id[k][0];
-                    const float * h = (k == i_batch_beg[s]) ? pending_h[s].data() : h_tgt + (size_t) (k - 1) * n_embd;
-                    dfr_rows[s].push_back({ batch_in.token[k], batch_in.pos[k] });
-                    dfr_h[s].insert(dfr_h[s].end(), h, h + n_embd);
-                }
-                for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
-                    if (i_batch_beg[s] >= 0) {
-                        dfr_last_p0[s] = batch_in.pos[i_batch_beg[s]];
-                    }
-                }
-            } else {
-                if (!dfr_flush()) {
-                    return false;
-                }
-                std::fill(dfr_last_p0.begin(), dfr_last_p0.end(), -1);
-            }
-        }
-
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared && !(defer_catchup && verify_sized)) {
+        if (!is_mem_shared) {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -2401,13 +2266,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 cost_hi[seq_id] = std::max(1, dp.n_max > 0 ? std::min((int) params.n_max, (int) dp.n_max) : (int) params.n_max);
                 cost_lo[seq_id] = std::min(std::max(1, (int) params.n_min), cost_hi[seq_id]);
                 cost.draft_begin(seq_id, cost_lo[seq_id], cost_hi[seq_id]);
-            }
-
-            if (defer_catchup) {
-                dfr_trim(seq_id, dp.pos0); // committed rows only (accept() already cut the rejected ones)
-                if (dfr_valid(seq_id)) {
-                    dfr_emit(seq_id);
-                }
             }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
@@ -2578,12 +2436,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (cost.on) {
             cost.accepted(seq_id, n_accepted);
-        }
-
-        if (defer_catchup && dfr_last_p0[seq_id] >= 0) {
-            // rows of the last verified batch past the accepted prefix were rejected drafts
-            dfr_trim(seq_id, dfr_last_p0[seq_id] + (llama_pos) n_accepted + 1);
-            dfr_last_p0[seq_id] = -1;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
