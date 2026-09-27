@@ -164,6 +164,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mamba(params);
         case LLM_ARCH_MAMBA2:
             return new llama_model_mamba2(params);
+        case LLM_ARCH_MAPLE:
+            return new llama_model_maple(params);
         case LLM_ARCH_JAMBA:
             return new llama_model_jamba(params);
         case LLM_ARCH_XVERSE:
@@ -1710,9 +1712,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // With the n-gram table left on disk, a populated mapping would pull the table's
-    // third of the file resident for nothing; readahead alone carries the sequential load.
-    ml.init_mappings(!params.ple_on_disk, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // With the n-gram table read by explicit preads (--lazy-mode on-direct), a populated mapping would pull
+    // the table's third of the file resident for nothing; readahead alone carries the sequential load.
+    ml.init_mappings(params.lazy_mode != LLAMA_LAZY_MODE_DIRECT, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2641,11 +2643,44 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // checks
         default:
             {
-                // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper. The qwen4exp
+                // draft head with an indexer runs the same sparse attention as the trunk, so its MTP context
+                // gets an indexer cache (hybrid-idx memory holding only the nextn layer) instead.
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 ||
+                     (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size == 0));
+
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                        hparams.indexer_head_size > 0) {
+                    llama_memory_hybrid_idx::layer_filter_cb f_attn =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    llama_memory_hybrid_idx::layer_filter_cb f_recr =
+                        [&](uint32_t /*il*/) { return false; };          // the nextn layer is not recurrent
+                    llama_memory_hybrid_idx::layer_filter_cb f_idx =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
+                    return new llama_memory_hybrid_idx(
+                        /* model             */ *this,
+                        /* attn_type_k       */ params.type_k,
+                        /* attn_type_v       */ params.type_v,
+                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_kv_size      */ cparams.n_ctx_seq,
+                        /* attn_n_pad        */ 1,
+                        /* attn_n_swa        */ hparams.n_swa,
+                        /* attn_swa_type     */ hparams.swa_type,
+                        /* recurrent_type_k  */ GGML_TYPE_F32,
+                        /* recurrent_type_v  */ GGML_TYPE_F32,
+                        /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                        /* n_seq_max         */ cparams.n_seq_max,
+                        /* n_rs_seq          */ cparams.n_rs_seq,
+                        /* offload           */ cparams.offload_kqv,
+                        /* unified           */ cparams.kv_unified,
+                        /* filter_attn       */ std::move(f_attn),
+                        /* filter_recr       */ std::move(f_recr),
+                        /* filter_idx        */ std::move(f_idx));
+                }
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2899,8 +2934,6 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
-        /*.ple_io_threads              =*/ 64,
-        /*.ple_cache_mb                =*/ 256,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -2911,8 +2944,6 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
-        /*.ple_on_disk                 =*/ false,
-        /*.ple_direct_io               =*/ true,
     };
 
     return result;
@@ -3156,6 +3187,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_SPARK2_5:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_MAPLE:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_DFLASH:

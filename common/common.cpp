@@ -1587,6 +1587,11 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
+    if (llama_n_rs_seq(ctx) > 0) {
+        COM_TRC("%s", "the context supports bounded partial sequence removal\n");
+        return COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+    }
+
     common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
 
     llama_memory_clear(mem, true);
@@ -1600,12 +1605,6 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     if (ret != 0) {
         COM_ERR("llama_decode() failed: %d\n", ret);
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-        goto done;
-    }
-
-    if (llama_n_rs_seq(ctx) > 0) {
-        COM_TRC("%s", "the context supports bounded partial sequence removal\n");
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
         goto done;
     }
 
@@ -1694,11 +1693,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
-    mparams.ple_on_disk     = params.ple_on_disk;
-    mparams.ple_direct_io   = params.ple_direct_io;
-    mparams.ple_io_threads  = params.ple_io_threads;
-    mparams.ple_cache_mb    = params.ple_cache_mb;
-
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {
