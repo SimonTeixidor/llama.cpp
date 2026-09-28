@@ -19,6 +19,15 @@
 typedef _Float16 w4a16_h16 __attribute__((ext_vector_type(16)));
 typedef float    w4a16_f8  __attribute__((ext_vector_type(8)));
 
+// F32 -> FP16 with round-to-nearest of the already rounded F32 value. Without the empty asm the compiler fuses the
+// multiply that produced v with the conversion into one v_fma_mixlo_f16 (single rounding), which is not what the
+// unfused path (F32 store, then a separate conversion kernel) computes. `#pragma clang fp contract(off)` does not
+// prevent that combine (checked in the ISA), the register barrier does.
+static __device__ __forceinline__ half w4a16_f2h_exact(float v) {
+    asm volatile("" : "+v"(v));
+    return __float2half(v);
+}
+
 // Permute the two 16-byte halves of a 32-byte LDS row to avoid repeated bank conflicts (gufo).
 static __device__ __forceinline__ w4a16_h16 w4a16_load_swz(const short * p) {
     union { w4a16_h16 f; uint4 q[2]; } bits;
@@ -189,10 +198,29 @@ static __device__ __forceinline__ void w4a16_decode_raw(const w4a16_raw & r, uin
 // BM weight rows x BN tokens per workgroup, WM x WN waves, K64 per LDS stage.
 // PAIRED: w = gate, w_up = up; physical tile rows alternate 16 gate / 16 up rows of the same logical rows,
 // so one wave owns both accumulators and the epilogue writes silu(gate)*up directly (gufo kGateUp).
-template <int BM, int BN, int WM, int WN, ggml_type type, int GROUP_SHIFT, bool PAIRED>
+// Epilogue flags (EPI). The accumulators are always FP32; these only select what is stored.
+//   W4A16_EPI_F32: y   [token*stride_y   + row] = v                      (the plain GEMM / SwiGLU output)
+//   W4A16_EPI_RES: y   [token*stride_y   + row] = v + res[token*stride_r + row]   (GGML_HIP_W4A16_RESADD: the
+//                  residual ADD that consumes the GEMM, fused into the store as in gufo's prefill_residual path;
+//                  y may alias res exactly: each element is read and written by the same lane)
+//   W4A16_EPI_F16: y16 [token*stride_y16 + row] = (half) v               (GGML_HIP_W4A16_F16ACT bit 4: the SwiGLU
+//                  output goes straight to the FP16 activations of ffn_down, as gufo keeps activations FP16)
+// The RES variant allocates 192 VGPR with 8 spilled (36 B scratch): ISA shows the spills only in the epilogue, the WMMA
+// loop is spill-free, and occupancy is 1 workgroup/CU from the 64 KB LDS in every variant (kernel-resources, no GPU).
+// Stores of v are bit-identical to the unfused path: v + res is the same F32 add ggml's ADD does, and (half) v is
+// the same round-to-nearest conversion the separate F32->F16 kernel does (w4a16_f2h_exact keeps the compiler from
+// fusing the last multiply and the conversion).
+enum {
+    W4A16_EPI_F32 = 1,
+    W4A16_EPI_RES = 2,
+    W4A16_EPI_F16 = 4,
+};
+
+template <int BM, int BN, int WM, int WN, ggml_type type, int GROUP_SHIFT, bool PAIRED, int EPI>
 __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
-        const char * __restrict__ w, const char * __restrict__ w_up, const short * __restrict__ x, float * __restrict__ y,
-        const int n, const int m, const int k, const int64_t w_row_bytes, const int64_t stride_y) {
+        const char * __restrict__ w, const char * __restrict__ w_up, const short * __restrict__ x, float * y,
+        const int n, const int m, const int k, const int64_t w_row_bytes, const int64_t stride_y,
+        const float * res, const int64_t stride_r, half * __restrict__ y16, const int64_t stride_y16) {
 #ifdef W4A16_DEVICE
     constexpr bool is_iq4 = type == GGML_TYPE_IQ4_XS;
     // One K64 LDS stage per iteration, gufo's schedule: commit (decode + store) -> barrier -> WMMA -> barrier.
@@ -359,7 +387,13 @@ __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
                     if (row < m && token < n) {
                         const float g = acc[i][j][l];
                         const float u = acc[i + 1][j][l];
-                        y[(int64_t) token*stride_y + row] = g/(1.0f + expf(-g)) * u;
+                        const float v = g/(1.0f + expf(-g)) * u;
+                        if constexpr (EPI & W4A16_EPI_F32) {
+                            y[(int64_t) token*stride_y + row] = v;
+                        }
+                        if constexpr (EPI & W4A16_EPI_F16) {
+                            y16[(int64_t) token*stride_y16 + row] = w4a16_f2h_exact(v);
+                        }
                     }
                 }
             }
@@ -376,13 +410,21 @@ __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
             for (int l = 0; l < 8; ++l) {
                 const int token = t0 + 2*l + hi;
                 if (row < m && token < n) {
-                    y[(int64_t) token*stride_y + row] = acc[i][j][l];
+                    const float v = acc[i][j][l];
+                    if constexpr (EPI & W4A16_EPI_RES) {
+                        y[(int64_t) token*stride_y + row] = v + res[(int64_t) token*stride_r + row];
+                    } else if constexpr (EPI & W4A16_EPI_F32) {
+                        y[(int64_t) token*stride_y + row] = v;
+                    }
+                    if constexpr (EPI & W4A16_EPI_F16) {
+                        y16[(int64_t) token*stride_y16 + row] = __float2half(v);
+                    }
                 }
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(w, w_up, x, y, n, m, k, w_row_bytes, stride_y);
+    GGML_UNUSED_VARS(w, w_up, x, y, n, m, k, w_row_bytes, stride_y, res, stride_r, y16, stride_y16);
     NO_DEVICE_CODE;
 #endif // W4A16_DEVICE
 }
@@ -437,14 +479,24 @@ bool ggml_cuda_should_use_w4a16(const ggml_tensor * src0, const ggml_tensor * sr
 // 256 rows x 256 tokens, 8x4 waves (each 32 rows x 64 tokens), gufo's large-projection tile. Best of the tile
 // variants measured on gfx1151 (256x256/4x4, 256x256/4x8, 128x256/4x4, 256x128/8x2, 128x128/4x2, 128x512/4x8:
 // 2-15 % slower; 128x256/2x4, 256x128/4x2, 128x128/2x2, 256x512/8x4 spill).
-template <bool PAIRED>
-static void w4a16_launch(const ggml_type type, const char * w, const char * w_up, const short * x, float * y,
-        const int n, const int m, const int k, const int64_t nb01, const int64_t stride_y, cudaStream_t stream) {
+struct w4a16_out {
+    float *       y         = nullptr;
+    int64_t       stride_y  = 0;
+    const float * res       = nullptr;
+    int64_t       stride_r  = 0;
+    half *        y16       = nullptr;
+    int64_t       stride_16 = 0;
+};
+
+template <bool PAIRED, int EPI>
+static void w4a16_launch(const ggml_type type, const char * w, const char * w_up, const short * x, const w4a16_out & o,
+        const int n, const int m, const int k, const int64_t nb01, cudaStream_t stream) {
     constexpr int BM = 256, BN = 256, WM = 8, WN = 4;
     const dim3 grid((n + BN - 1)/BN, (m + (PAIRED ? BM/2 : BM) - 1)/(PAIRED ? BM/2 : BM));
     const dim3 block(WM*WN*32);
     switch (type) {
-#define W4A16_CASE(T) case T: mul_mat_w4a16<BM, BN, WM, WN, T, 5, PAIRED><<<grid, block, 0, stream>>>(w, w_up, x, y, n, m, k, nb01, stride_y); break
+#define W4A16_CASE(T) case T: mul_mat_w4a16<BM, BN, WM, WN, T, 5, PAIRED, EPI><<<grid, block, 0, stream>>>( \
+        w, w_up, x, o.y, n, m, k, nb01, o.stride_y, o.res, o.stride_r, o.y16, o.stride_16); break
         W4A16_CASE(GGML_TYPE_IQ4_XS);
         W4A16_CASE(GGML_TYPE_Q4_0);
         W4A16_CASE(GGML_TYPE_Q8_0);
@@ -468,6 +520,147 @@ static void w4a16_convert_src1(const ggml_tensor * src1, half * x16, cudaStream_
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// GGML_HIP_W4A16_F16ACT: FP16 activations produced once and reused (gufo keeps prefill activations FP16 end to end:
+// prefill_norm.hip writes the normed hidden state as FP16 and every projection reads it, prefill_chunk.cpp).
+// The F32 tensors are still written (except the SwiGLU output under bit 4, which has exactly one consumer), so any
+// cache miss simply falls back to converting F32 again.
+
+int ggml_cuda_w4a16_f16act() {
+    static const int v = [] {
+        const char * e = getenv("GGML_HIP_W4A16_F16ACT");
+        int f = e ? atoi(e) : 7;
+        if (f & 2) {
+            f |= 1; // the norm writes into the shared cache, so bit 2 implies bit 1
+        }
+        return f;
+    }();
+    return ggml_cuda_w4a16_mode() == 1 ? v : 0;
+}
+
+bool ggml_cuda_w4a16_resadd() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_HIP_W4A16_RESADD");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return ggml_cuda_w4a16_mode() == 1 && v;
+}
+
+void ggml_cuda_w4a16_x16_reset(ggml_backend_cuda_context & ctx) {
+    ctx.w4a16_x16.release();
+}
+
+// Called before every executed node: anything that writes over the cached tensor's memory invalidates the copy.
+// Within one graph a live tensor is never overwritten (ggml-alloc only reuses memory after the last consumer), so
+// this is a belt-and-braces guard against explicit in-place ops; it costs one range test per node.
+void ggml_cuda_w4a16_x16_note_write(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    auto & c = ctx.w4a16_x16;
+    if (c.key == nullptr || node == c.key || node->data == nullptr) {
+        return;
+    }
+    const char * a0 = (const char *) node->data;
+    const char * a1 = a0 + ggml_nbytes(node);
+    const char * b0 = (const char *) c.data;
+    const char * b1 = b0 + c.nb1*c.ne1;
+    if (a0 < b1 && b0 < a1) {
+        c.release();
+    }
+}
+
+static bool w4a16_x16_hit(const ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    const auto & c = ctx.w4a16_x16;
+    return c.key == t && c.buf != nullptr && c.data == t->data && c.ne0 == t->ne[0] && c.ne1 == t->ne[1] && c.nb1 == t->nb[1];
+}
+
+// New cache entry for t (evicting the old one first, which keeps the pool usage stack-like), returns its buffer.
+static half * w4a16_x16_insert(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    auto & c = ctx.w4a16_x16;
+    c.release();
+    c.pool = &ctx.pool();
+    c.buf  = (half *) c.pool->alloc((size_t) t->ne[0]*t->ne[1]*sizeof(half), &c.size);
+    c.key  = t;
+    c.data = t->data;
+    c.ne0  = t->ne[0];
+    c.ne1  = t->ne[1];
+    c.nb1  = t->nb[1];
+    return c.buf;
+}
+
+// FP16 [n][k] view of src1: cached copy (bit 1), else a fresh conversion into `local`.
+static const half * w4a16_get_x16(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_cuda_pool_alloc<half> & local) {
+    cudaStream_t stream = ctx.stream();
+    // the cache is only used on the main stream (graph-level stream concurrency would race on it)
+    const bool share = (ggml_cuda_w4a16_f16act() & 1) && ctx.curr_stream_no == 0;
+    if (share && w4a16_x16_hit(ctx, src1)) {
+        return ctx.w4a16_x16.buf;
+    }
+    half * x16 = share ? w4a16_x16_insert(ctx, src1) : local.alloc(ctx.pool(), (size_t) src1->ne[0]*src1->ne[1]);
+    w4a16_convert_src1(src1, x16, stream);
+    return x16;
+}
+
+// rms_norm(x)*w -> F32 dst and FP16 copy. Same block size, reduction and expression order as norm.cu's
+// rms_norm_f32<1024, true> (ncols >= 1024), so the F32 output is bit-identical to the stock fused RMS_NORM+MUL.
+template <int block_size>
+static __global__ void w4a16_rms_norm_mul_f16(const float * __restrict__ x, const float * __restrict__ w,
+        float * __restrict__ dst, half * __restrict__ dst16, const int ncols, const int64_t stride_row,
+        const int64_t stride_dst, const float eps) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    x     += row*stride_row;
+    dst   += row*stride_dst;
+    dst16 += (int64_t) row*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    __shared__ float s_sum[32];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    for (int col = tid; col < ncols; col += block_size) {
+        const float v = scale * x[col] * w[col];
+        dst[col]   = v;
+        dst16[col] = w4a16_f2h_exact(v);
+    }
+}
+
+bool ggml_cuda_w4a16_can_norm_f16(const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    if (!(ggml_cuda_w4a16_f16act() & 2) || rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if (w == rms_norm || (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return false;
+    }
+    const int64_t k = x->ne[0];
+    return x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+        k >= 1024 && ggml_nelements(w) == k && w->ne[0] == k && ggml_is_contiguous(w) &&
+        x->nb[0] == sizeof(float) && x->ne[2] == 1 && x->ne[3] == 1 &&
+        ggml_are_same_shape(mul, x) && mul->nb[0] == sizeof(float) && mul->nb[1] >= (size_t) k*sizeof(float) &&
+        x->ne[1] <= INT_MAX;
+}
+
+void ggml_cuda_w4a16_norm_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    const int k = x->ne[0];
+    const int n = x->ne[1];
+    // the kernel writes into a fresh cache entry keyed on the MUL output, which the W4A16 GEMMs then find
+    half * x16 = w4a16_x16_insert(ctx, mul);
+    w4a16_rms_norm_mul_f16<1024><<<n, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data,
+        (float *) mul->data, x16, k, x->nb[1]/sizeof(float), mul->nb[1]/sizeof(float), eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+
 void ggml_cuda_mul_mat_w4a16_swiglu(ggml_backend_cuda_context & ctx, const ggml_tensor * w_gate, const ggml_tensor * w_up,
                                     const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(w_gate->type == w_up->type && w_gate->nb[1] == w_up->nb[1] && ggml_are_same_shape(w_gate, w_up));
@@ -482,16 +675,63 @@ void ggml_cuda_mul_mat_w4a16_swiglu(ggml_backend_cuda_context & ctx, const ggml_
     const int n = src1->ne[1];
     cudaStream_t stream = ctx.stream();
 
-    ggml_cuda_pool_alloc<half> x16(ctx.pool(), (size_t) n*k);
-    w4a16_convert_src1(src1, x16.get(), stream);
+    ggml_cuda_pool_alloc<half> local;
+    const half * x16 = w4a16_get_x16(ctx, src1, local);
 
-    const int64_t stride_y = dst->nb[1] / sizeof(float);
-    w4a16_launch<true>(w_gate->type, (const char *) w_gate->data, (const char *) w_up->data, (const short *) x16.get(),
-        (float *) dst->data, n, m, k, w_gate->nb[1], stride_y, stream);
+    w4a16_out o;
+    o.y        = (float *) dst->data;
+    o.stride_y = dst->nb[1] / sizeof(float);
+    w4a16_launch<true, W4A16_EPI_F32>(w_gate->type, (const char *) w_gate->data, (const char *) w_up->data,
+        (const short *) x16, o, n, m, k, w_gate->nb[1], stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void ggml_cuda_mul_mat_w4a16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+// GGML_HIP_W4A16_F16ACT bit 4: silu(gate(src1))*up(src1) is written only as FP16 into a scratch buffer, and ffn_down
+// reads it directly (no F32 SwiGLU tensor, no conversion). dst = down(...) [+ residual].
+void ggml_cuda_mul_mat_w4a16_ffn(ggml_backend_cuda_context & ctx, const ggml_tensor * w_gate, const ggml_tensor * w_up,
+                                 const ggml_tensor * src1, const ggml_tensor * w_down, ggml_tensor * dst, const ggml_tensor * residual) {
+    GGML_ASSERT(w_gate->type == w_up->type && w_gate->nb[1] == w_up->nb[1] && ggml_are_same_shape(w_gate, w_up));
+    GGML_ASSERT(w_down->ne[0] == w_gate->ne[1]);
+    static bool logged = false;
+    if (!logged) {
+        GGML_LOG_INFO("%s: W4A16 FFN chain gate/up/SwiGLU -> FP16 -> down%s active (%s/%s, n=%lld)\n", __func__,
+            residual ? " + residual" : "", ggml_type_name(w_gate->type), ggml_type_name(w_down->type), (long long) src1->ne[1]);
+        logged = true;
+    }
+    const int k  = w_gate->ne[0];
+    const int ff = w_gate->ne[1];
+    const int n  = src1->ne[1];
+    const int m  = w_down->ne[1];
+    cudaStream_t stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<half> local;
+    const half * x16 = w4a16_get_x16(ctx, src1, local);
+    ggml_cuda_pool_alloc<half> h16(ctx.pool(), (size_t) n*ff);
+
+    w4a16_out o1;
+    o1.y16       = h16.get();
+    o1.stride_16 = ff;
+    w4a16_launch<true, W4A16_EPI_F16>(w_gate->type, (const char *) w_gate->data, (const char *) w_up->data,
+        (const short *) x16, o1, n, ff, k, w_gate->nb[1], stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    w4a16_out o2;
+    o2.y        = (float *) dst->data;
+    o2.stride_y = dst->nb[1] / sizeof(float);
+    if (residual) {
+        o2.res      = (const float *) residual->data;
+        o2.stride_r = residual->nb[1] / sizeof(float);
+        w4a16_launch<false, W4A16_EPI_RES>(w_down->type, (const char *) w_down->data, nullptr, (const short *) h16.get(),
+            o2, n, m, ff, w_down->nb[1], stream);
+    } else {
+        w4a16_launch<false, W4A16_EPI_F32>(w_down->type, (const char *) w_down->data, nullptr, (const short *) h16.get(),
+            o2, n, m, ff, w_down->nb[1], stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_mul_mat_w4a16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                             const ggml_tensor * residual) {
     static bool logged = false;
     if (!logged) {
         GGML_LOG_INFO("%s: W4A16 prefill GEMM path active (%s, n=%lld)\n", __func__,
@@ -503,17 +743,28 @@ void ggml_cuda_mul_mat_w4a16(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int n = src1->ne[1];
     cudaStream_t stream = ctx.stream();
 
-    ggml_cuda_pool_alloc<half> x16(ctx.pool(), (size_t) n*k);
-    w4a16_convert_src1(src1, x16.get(), stream);
+    ggml_cuda_pool_alloc<half> local;
+    const half * x16 = w4a16_get_x16(ctx, src1, local);
 
-    const int64_t stride_y = dst->nb[1] / sizeof(float);
-    const char  * w  = (const char *) src0->data;
-    const short * xs = (const short *) x16.get();
-    float       * yd = (float *) dst->data;
-    const int64_t nb01 = src0->nb[1];
-
+    w4a16_out o;
+    o.y        = (float *) dst->data;
+    o.stride_y = dst->nb[1] / sizeof(float);
     // 256 rows x 256 tokens, 8x4 waves (each 32 rows x 64 tokens). Measured best of 7 tile variants on gfx1151
     // (128x256, 256x128, 128x128 spill; 256x256/4x4, 256x256/4x8, 128x256/4x4 were 3-10 % slower).
-    w4a16_launch<false>(src0->type, w, nullptr, xs, yd, n, m, k, nb01, stride_y, stream);
+    if (residual) {
+        static bool logged_res = false;
+        if (!logged_res) {
+            GGML_LOG_INFO("%s: W4A16 residual-add epilogue active (%s, n=%lld)\n", __func__,
+                ggml_type_name(src0->type), (long long) n);
+            logged_res = true;
+        }
+        o.res      = (const float *) residual->data;
+        o.stride_r = residual->nb[1] / sizeof(float);
+        w4a16_launch<false, W4A16_EPI_RES>(src0->type, (const char *) src0->data, nullptr, (const short *) x16, o, n, m, k,
+            src0->nb[1], stream);
+    } else {
+        w4a16_launch<false, W4A16_EPI_F32>(src0->type, (const char *) src0->data, nullptr, (const short *) x16, o, n, m, k,
+            src0->nb[1], stream);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
