@@ -264,6 +264,7 @@ struct w4a16_id_args {
     const int32_t * ids_src1;
     const int32_t * ids_dst;
     int64_t         nb02;     // bytes between experts
+    int             skip;     // skip the WMMAs of 16-token sub-tiles past the expert's slot count
 };
 
 template <int BM, int BN, int WM, int WN, ggml_type type, int GROUP_SHIFT, bool PAIRED, int EPI, bool ROUTED = false>
@@ -271,7 +272,7 @@ __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
         const char * __restrict__ w, const char * __restrict__ w_up, const short * __restrict__ x, float * y,
         const int n, const int m, const int k, const int64_t w_row_bytes, const int64_t stride_y,
         const float * res, const int64_t stride_r, half * __restrict__ y16, const int64_t stride_y16,
-        const w4a16_id_args ida = {nullptr, nullptr, nullptr, nullptr, 0}) {
+        const w4a16_id_args ida = {nullptr, nullptr, nullptr, nullptr, 0, 0}) {
 #ifdef W4A16_DEVICE
     constexpr bool is_iq4 = type == GGML_TYPE_IQ4_XS;
     // One K64 LDS stage per iteration, gufo's schedule: commit (decode + store) -> barrier -> WMMA -> barrier.
@@ -421,6 +422,12 @@ __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
             }
 #pragma unroll
             for (int j = 0; j < WTS; ++j) {
+                if constexpr (ROUTED) {
+                    // wave-uniform: this 16-token sub-tile holds no slot of the expert (gufo's live_tok_tiles)
+                    if (ida.skip && t_block + (wt*WTS + j)*16 >= e_count) {
+                        continue;
+                    }
+                }
                 const w4a16_h16 b = w4a16_load_swz(&s_b[buf][ks][wt*WTS + j][sl ^ (ks & 3)][0]);
 #pragma unroll
                 for (int i = 0; i < WRS; ++i) {
@@ -871,9 +878,33 @@ int ggml_cuda_w4a16_moe_mode() {
     return mode;
 }
 
-// Tile: 128 weight rows x 64 tokens, 4x2 waves. Fastest of 8 configs measured on qwen3.6-35b (128x32, 256x32,
-// 64x32 and single-wave-column variants: 1-10 % slower kernel time; results/2026-09-28-moe-w4a16/NOTES.md).
-static constexpr int W4A16_ID_BM = 128, W4A16_ID_BN = 64, W4A16_ID_WM = 4, W4A16_ID_WN = 2;
+// Token tile: 128 weight rows x 128 tokens (4x2 waves, gufo's BN for chunks >= 1024) once the ubatch gives the average
+// expert >= 64 slots, else 128 x 64; the WMMAs of dead 16-token sub-tiles are skipped in both. Measured on qwen3.6-35b
+// (256 experts, top-8; pp4096, results/2026-09-29-prefill-default2/): 128 tokens vs 64 at ub 1024 (32 slots/expert)
+// -1.8 %, at ub 2048 (64) +1.1 %, at ub 4096 (128) the tiles tie without the skip and 128 wins by ~2 % with it
+// (results/2026-09-28-moe-prefill2/). 256x128/8x2 -5 %; 128x32, 256x32, 64x32 and single-wave-column variants 1-10 %
+// slower kernel time (results/2026-09-28-moe-w4a16/).
+// GGML_HIP_W4A16_MOE_T128=0 / 1: always 64 / always 128 tokens. GGML_HIP_W4A16_MOE_SKIP=0: no sub-tile skip.
+static constexpr int W4A16_ID_BM = 128, W4A16_ID_WM = 4, W4A16_ID_WN = 2;
+
+static int w4a16_id_bn(const int64_t n_slots, const int64_t n_expert) {
+    static const int forced = [] {
+        const char * e = getenv("GGML_HIP_W4A16_MOE_T128");
+        return e == nullptr ? 0 : atoi(e) != 0 ? 128 : 64;
+    }();
+    if (forced != 0) {
+        return forced;
+    }
+    return n_slots >= 64*n_expert ? 128 : 64;
+}
+
+static int w4a16_id_skip() {
+    static const int skip = [] {
+        const char * e = getenv("GGML_HIP_W4A16_MOE_SKIP");
+        return e == nullptr || atoi(e) != 0 ? 1 : 0;
+    }();
+    return skip;
+}
 
 static __global__ void w4a16_id_tiles(const int32_t * __restrict__ bounds, int32_t * __restrict__ tiles,
                                       const int n_experts, const int bn) {
@@ -937,11 +968,11 @@ bool ggml_cuda_should_use_w4a16_id(const ggml_tensor * src0, const ggml_tensor *
     return true;
 }
 
-template <bool PAIRED>
+template <int BN, bool PAIRED>
 static void w4a16_id_launch(const ggml_type type, const char * w, const char * w_up, const short * x, float * y,
         const int m, const int k, const int64_t nb01, const int64_t stride_y, const w4a16_id_args & ida,
         const int max_tiles, cudaStream_t stream) {
-    constexpr int BM = W4A16_ID_BM, BN = W4A16_ID_BN, WM = W4A16_ID_WM, WN = W4A16_ID_WN;
+    constexpr int BM = W4A16_ID_BM, WM = W4A16_ID_WM, WN = W4A16_ID_WN;
     const dim3 grid((m + (PAIRED ? BM/2 : BM) - 1)/(PAIRED ? BM/2 : BM), max_tiles);
     const dim3 block(WM*WN*32);
     switch (type) {
@@ -983,17 +1014,22 @@ static void w4a16_id_run(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     ggml_get_to_fp16_nc_cuda(GGML_TYPE_F32)(src1->data, x16.get(), k, ne11, n_tokens, 1,
         src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float), stream);
 
-    const int bn        = W4A16_ID_BN;
+    const int bn        = w4a16_id_bn(n_slots, n_expert);
     const int max_tiles = (int) (n_slots/bn + std::min<int64_t>(n_expert, n_slots) + 1);
     ggml_cuda_pool_alloc<int32_t> tiles(ctx.pool(), 1 + max_tiles);
     w4a16_id_tiles<<<1, (unsigned) GGML_PAD(n_expert, 32), 0, stream>>>(bounds.get(), tiles.get(), (int) n_expert, bn);
     CUDA_CHECK(cudaGetLastError());
 
-    const w4a16_id_args ida = { tiles.get(), bounds.get(), ids_src1.get(), ids_dst.get(), (int64_t) src0->nb[2] };
+    const w4a16_id_args ida = { tiles.get(), bounds.get(), ids_src1.get(), ids_dst.get(), (int64_t) src0->nb[2], w4a16_id_skip() };
     const char * w    = (const char *) src0->data;
     const char * w_up = PAIRED ? w + (int64_t) m*src0->nb[1] : nullptr;
-    w4a16_id_launch<PAIRED>(src0->type, w, w_up, (const short *) x16.get(), y, m, k, src0->nb[1], stride_y, ida,
-        max_tiles, stream);
+    if (bn == 128) {
+        w4a16_id_launch<128, PAIRED>(src0->type, w, w_up, (const short *) x16.get(), y, m, k, src0->nb[1], stride_y, ida,
+            max_tiles, stream);
+    } else {
+        w4a16_id_launch< 64, PAIRED>(src0->type, w, w_up, (const short *) x16.get(), y, m, k, src0->nb[1], stride_y, ida,
+            max_tiles, stream);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
