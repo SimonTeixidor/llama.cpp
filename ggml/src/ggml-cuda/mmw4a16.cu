@@ -17,6 +17,16 @@
 #define W4A16_DEVICE
 #endif
 
+// IQ3_XXS weights also take the W4A16 dense / routed kernels (qwen35moe IQ4_XS-4.19bpw: shared experts in 33 layers,
+// 6 gate_up + 3 down expert layers, a few projections; on MMQ they ran at ~2 TF). GGML_HIP_W4A16_IQ3=0: back to MMQ.
+static bool ggml_cuda_w4a16_iq3() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_HIP_W4A16_IQ3");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 typedef _Float16 w4a16_h16 __attribute__((ext_vector_type(16)));
 typedef float    w4a16_f8  __attribute__((ext_vector_type(8)));
 
@@ -132,6 +142,15 @@ static __device__ __forceinline__ void w4a16_load_raw(const uint8_t * row, const
         __builtin_memcpy(r.hi, b + 128 + half*32 + (sub & 1)*16, 16);
         r.h1 = b[192 + half*8 + seg*2 + (sub & 1)];     // int8 scale
         r.h0 = *reinterpret_cast<const uint16_t *>(b + 208);
+    } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        // 98-byte blocks (2-byte aligned): d, 64 grid-index bytes, 8 x u32 scale+signs words
+        const uint8_t * b = row + (sub/16)*sizeof(block_iq3_xxs);
+        const unsigned ib32 = (sub/2) & 7;
+        r.h0 = *reinterpret_cast<const uint16_t *>(b);
+        const uint16_t * q = reinterpret_cast<const uint16_t *>(b + 2 + 8*ib32 + 4*(sub & 1));
+        r.lo[0] = (uint32_t) q[0] | ((uint32_t) q[1] << 16);
+        const uint16_t * ss = reinterpret_cast<const uint16_t *>(b + 2 + 64 + 4*ib32);
+        r.h1 = (uint32_t) ss[0] | ((uint32_t) ss[1] << 16);
     } else {
         static_assert(type == GGML_TYPE_Q8_0, "unsupported type");
     }
@@ -185,6 +204,25 @@ static __device__ __forceinline__ void w4a16_decode_raw(const w4a16_raw & r, uin
             const int lo = (r.lo[i/4] >> (8*(i % 4) + lshift)) & 0xF;
             const int hi = (r.hi[i/4] >> (8*(i % 4) + 2*seg)) & 0x3;
             q[i] = (lo | (hi << 4)) - 32;
+        }
+    } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        // ggml dequantize_row_iq3_xxs: db = d*(0.5 + aux>>28)*0.5, 8 values per 7-bit sign index, sign parity bit 7
+        const uint32_t aux = r.h1;
+        scale = w4a16_h2f(r.h0) * (0.5f + (float) (aux >> 28)) * 0.5f;
+        const unsigned l0 = 2*(sub & 1);
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const unsigned s7    = (aux >> (7*(l0 + g))) & 127;
+            const unsigned signs = s7 | ((__popc(s7) & 1) << 7); // == ksigns_iq2xs[s7]
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t grid = iq3xxs_grid[(r.lo[0] >> (8*(2*g + h))) & 0xFF];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int v = (grid >> (8*j)) & 0xFF;
+                    q[8*g + 4*h + j] = (signs >> (4*h + j)) & 1 ? -v : v;
+                }
+            }
         }
     }
     union { w4a16_h16 f; uint4 u[2]; } res;
@@ -483,6 +521,11 @@ bool ggml_cuda_should_use_w4a16(const ggml_tensor * src0, const ggml_tensor * sr
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
             break;
+        case GGML_TYPE_IQ3_XXS:
+            if (!ggml_cuda_w4a16_iq3()) {
+                return false;
+            }
+            break;
         default:
             return false;
     }
@@ -545,6 +588,7 @@ static void w4a16_launch(const ggml_type type, const char * w, const char * w_up
         W4A16_CASE(GGML_TYPE_Q4_K);
         W4A16_CASE(GGML_TYPE_Q5_K);
         W4A16_CASE(GGML_TYPE_Q6_K);
+        W4A16_CASE(GGML_TYPE_IQ3_XXS);
 #undef W4A16_CASE
         default: GGML_ABORT("unsupported type");
     }
@@ -867,6 +911,11 @@ bool ggml_cuda_should_use_w4a16_id(const ggml_tensor * src0, const ggml_tensor *
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
             break;
+        case GGML_TYPE_IQ3_XXS:
+            if (!ggml_cuda_w4a16_iq3()) {
+                return false;
+            }
+            break;
         default:
             return false;
     }
@@ -904,6 +953,7 @@ static void w4a16_id_launch(const ggml_type type, const char * w, const char * w
         W4A16_ID_CASE(GGML_TYPE_Q4_K);
         W4A16_ID_CASE(GGML_TYPE_Q5_K);
         W4A16_ID_CASE(GGML_TYPE_Q6_K);
+        W4A16_ID_CASE(GGML_TYPE_IQ3_XXS);
 #undef W4A16_ID_CASE
         default: GGML_ABORT("unsupported type");
     }

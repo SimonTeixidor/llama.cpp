@@ -12926,7 +12926,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // W4A16 routed MoE GEMM (RDNA3.5 default, GGML_HIP_W4A16_MOE=0 disables): qwen35moe expert shapes (256 experts, top-8, k 2048 / 512) + tails.
     // Large and CPU-expensive, so only with TBO_W4A16_MOE_CASES=1 (keeps the default grid's reference counts).
     if (getenv("TBO_W4A16_MOE_CASES") != nullptr) {
-        for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ3_XXS}) {
             for (int64_t n : {511, 512, 1024, 1037}) {
                 test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 256, 8, true,  1024, n, 2048)); // gate_up
                 test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 256, 8, false, 2048, n,  512)); // down
@@ -12940,6 +12940,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_moe_gate_up_swiglu(t, 256, 8, 576, 700, 512)); // n_ff % 128 != 0
             test_cases.emplace_back(new test_moe_gate_up_swiglu(t, 8, 2, 256, 600, 256));
+        }
+    }
+
+    // W4A16 IQ3_XXS (RDNA3.5 default, GGML_HIP_W4A16_IQ3=0 disables): qwen35moe dense shapes (shared expert 512/2048,
+    // attn_qkv 8192, gate 4096) + row tails (m % 128 != 0, m % 4 != 0), dense and fused gate/up/SwiGLU, plus Q5_K / Q4_K
+    // at the same shapes. Only with TBO_W4A16_IQ3_CASES=1.
+    if (getenv("TBO_W4A16_IQ3_CASES") != nullptr) {
+        for (ggml_type t : {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K}) {
+            for (int64_t n : {512, 1037, 2048}) {
+                for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{512, 2048}, {2048, 512}, {8192, 2048}, {4096, 2048},
+                                                                       {5120 - 64, 2048}, {5120 - 3, 2048}, {5120, 5120}}) {
+                    test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                }
+            }
+            for (int64_t tokens : {512, 1037}) {
+                for (int64_t rows : {512, 1024 - 3, 5120}) {
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(t, GGML_GLU_OP_SWIGLU, tokens, rows, 2048,
+                        false, 16, 8, false, false, true, false, { 1, 1 }));
+                }
+            }
         }
     }
 
