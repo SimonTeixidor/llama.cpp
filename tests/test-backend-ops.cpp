@@ -5990,6 +5990,46 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+// merged gate_up MUL_MAT_ID -> gate/up views -> SWIGLU (qwen35moe expert FFN; W4A16 routed fused path)
+struct test_moe_gate_up_swiglu : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t n_ff;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override { return VARS_TO_STR6(type_a, n_mats, n_used, n_ff, n, k); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_GATE_UP_SWIGLU"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_moe_gate_up_swiglu(ggml_type type_a, int n_mats, int n_used, int64_t n_ff, int64_t n, int64_t k)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), n_ff(n_ff), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, 2*n_ff, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * gu = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(gu, "gate_up");
+        ggml_tensor * gate = ggml_view_3d(ctx, gu, n_ff, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
+        ggml_tensor * up   = ggml_view_3d(ctx, gu, n_ff, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], n_ff*gu->nb[0]);
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override { init_mul_mat_id_tensors(ctx, n_mats); }
+};
+
 // GGML_OP_OUT_PROD
 // GGML_OP_MUL_MAT group: independent single-column matvecs on one activation vector
 // (RDNA3.5 CUDA launches independent Q8_0 segments as one grouped kernel)
@@ -12883,6 +12923,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // W4A16 routed MoE GEMM (RDNA3.5 default, GGML_HIP_W4A16_MOE=0 disables): qwen35moe expert shapes (256 experts, top-8, k 2048 / 512) + tails.
+    // Large and CPU-expensive, so only with TBO_W4A16_MOE_CASES=1 (keeps the default grid's reference counts).
+    if (getenv("TBO_W4A16_MOE_CASES") != nullptr) {
+        for (ggml_type t : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+            for (int64_t n : {511, 512, 1024, 1037}) {
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 256, 8, true,  1024, n, 2048)); // gate_up
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 256, 8, false, 2048, n,  512)); // down
+            }
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 256, 8, true, 1024 - 64, 777,  768)); // m % 128 != 0
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 256, 8, false, 1003,     600,  256)); // m % 4 != 0
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32,   8, 2, false,  512,     600, 1024)); // many tiles/expert
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32,  32, 4, true,   256,     513,  512));
+            for (int64_t n : {512, 1037}) {
+                test_cases.emplace_back(new test_moe_gate_up_swiglu(t, 256, 8, 512, n, 2048));
+            }
+            test_cases.emplace_back(new test_moe_gate_up_swiglu(t, 256, 8, 576, 700, 512)); // n_ff % 128 != 0
+            test_cases.emplace_back(new test_moe_gate_up_swiglu(t, 8, 2, 256, 600, 256));
+        }
+    }
+
     // Both sides of the same row-count boundary as above, on the fused path.
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
@@ -13136,6 +13196,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // W4A16 routed MoE lever: qwen35moe expert shapes only (TBO_W4A16_MOE_PERF=1 replaces the whole perf list)
+    if (getenv("TBO_W4A16_MOE_PERF") != nullptr) {
+        for (int64_t n : {1024, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 256, 8, true,  1024, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 256, 8, false, 2048, n,  512));
+            test_cases.emplace_back(new test_moe_gate_up_swiglu(GGML_TYPE_IQ4_XS, 256, 8, 512, n, 2048));
+        }
+        return test_cases;
+    }
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (int width : {90, 128}) {

@@ -11,6 +11,7 @@
 #include "mmw4a16.cuh"
 #include "mmq.cuh"
 #include "convert.cuh"
+#include "mmid.cuh"
 
 #if defined(GGML_USE_HIP) && defined(RDNA3)
 #define W4A16_DEVICE
@@ -216,11 +217,23 @@ enum {
     W4A16_EPI_F16 = 4,
 };
 
-template <int BM, int BN, int WM, int WN, ggml_type type, int GROUP_SHIFT, bool PAIRED, int EPI>
+// ROUTED (MUL_MAT_ID): blockIdx.y indexes an (expert, token tile) map built on the device from the expert
+// bounds of the compacted slot list (tiles[0] = number of live tiles), blockIdx.x the weight row tile. Token t of
+// a tile is compact slot bounds[e] + tile*BN + t; its activation row is ids_src1[slot], its output row ids_dst[slot].
+struct w4a16_id_args {
+    const int32_t * tiles;
+    const int32_t * bounds;
+    const int32_t * ids_src1;
+    const int32_t * ids_dst;
+    int64_t         nb02;     // bytes between experts
+};
+
+template <int BM, int BN, int WM, int WN, ggml_type type, int GROUP_SHIFT, bool PAIRED, int EPI, bool ROUTED = false>
 __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
         const char * __restrict__ w, const char * __restrict__ w_up, const short * __restrict__ x, float * y,
         const int n, const int m, const int k, const int64_t w_row_bytes, const int64_t stride_y,
-        const float * res, const int64_t stride_r, half * __restrict__ y16, const int64_t stride_y16) {
+        const float * res, const int64_t stride_r, half * __restrict__ y16, const int64_t stride_y16,
+        const w4a16_id_args ida = {nullptr, nullptr, nullptr, nullptr, 0}) {
 #ifdef W4A16_DEVICE
     constexpr bool is_iq4 = type == GGML_TYPE_IQ4_XS;
     // One K64 LDS stage per iteration, gufo's schedule: commit (decode + store) -> barrier -> WMMA -> barrier.
@@ -245,7 +258,23 @@ __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
 
     // grouped rasterisation: GROUP row tiles walk all token tiles together (input reuse in L2)
     unsigned row_tile, token_tile;
-    {
+    int e_begin = 0, e_count = n;
+    if constexpr (ROUTED) {
+        // routed: x = row tile (fastest, so the row tiles of one token tile share its activations in L2)
+        if ((int) blockIdx.y >= ida.tiles[0]) {
+            return;
+        }
+        const int tile = ida.tiles[1 + blockIdx.y];
+        const int e    = tile & 0xFFFF;
+        row_tile   = blockIdx.x;
+        token_tile = tile >> 16;
+        e_begin    = ida.bounds[e];
+        e_count    = ida.bounds[e + 1] - e_begin;
+        w += e*ida.nb02;
+        if constexpr (PAIRED) {
+            w_up += e*ida.nb02;
+        }
+    } else {
         constexpr unsigned group = 1u << GROUP_SHIFT;
         const unsigned first  = (blockIdx.y >> GROUP_SHIFT) << GROUP_SHIFT;
         const unsigned within = (blockIdx.y & (group - 1))*gridDim.x + blockIdx.x;
@@ -279,7 +308,11 @@ __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
 #pragma unroll
     for (int p = 0; p < PFB; ++p) {
         const int t = t_block + (p*kThreads + tid)/BK;
-        x_row[p] = x + (int64_t) (t < n ? t : n - 1)*k;
+        if constexpr (ROUTED) {
+            x_row[p] = x + (int64_t) ida.ids_src1[e_begin + (t < e_count ? t : e_count - 1)]*k;
+        } else {
+            x_row[p] = x + (int64_t) (t < n ? t : n - 1)*k;
+        }
     }
 
     uint4        rb[PFB][2];
@@ -373,6 +406,15 @@ __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
     }
 
     const int hi = lane / 16;
+    // output row of token t of this tile (-1: none)
+    const auto out_row = [&](const int token) -> int64_t {
+        if constexpr (ROUTED) {
+            // routed: token indexes the expert's compact slots
+            return token < e_count ? (int64_t) ida.ids_dst[e_begin + token] : -1;
+        } else {
+            return token < n ? (int64_t) token : -1;
+        }
+    };
     if constexpr (PAIRED) {
         static_assert(WRS % 2 == 0, "paired tile needs an even number of row fragments per wave");
 #pragma unroll
@@ -383,16 +425,16 @@ __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
                 const int t0  = t_block + (wt*WTS + j)*16;
 #pragma unroll
                 for (int l = 0; l < 8; ++l) {
-                    const int token = t0 + 2*l + hi;
-                    if (row < m && token < n) {
+                    const int64_t orow = out_row(t0 + 2*l + hi);
+                    if (row < m && orow >= 0) {
                         const float g = acc[i][j][l];
                         const float u = acc[i + 1][j][l];
                         const float v = g/(1.0f + expf(-g)) * u;
                         if constexpr (EPI & W4A16_EPI_F32) {
-                            y[(int64_t) token*stride_y + row] = v;
+                            y[orow*stride_y + row] = v;
                         }
                         if constexpr (EPI & W4A16_EPI_F16) {
-                            y16[(int64_t) token*stride_y16 + row] = w4a16_f2h_exact(v);
+                            y16[orow*stride_y16 + row] = w4a16_f2h_exact(v);
                         }
                     }
                 }
@@ -408,23 +450,23 @@ __launch_bounds__(WM*WN*32) __global__ void mul_mat_w4a16(
             const int t0  = t_block + (wt*WTS + j)*16;
 #pragma unroll
             for (int l = 0; l < 8; ++l) {
-                const int token = t0 + 2*l + hi;
-                if (row < m && token < n) {
+                const int64_t orow = out_row(t0 + 2*l + hi);
+                if (row < m && orow >= 0) {
                     const float v = acc[i][j][l];
                     if constexpr (EPI & W4A16_EPI_RES) {
-                        y[(int64_t) token*stride_y + row] = v + res[(int64_t) token*stride_r + row];
+                        y[orow*stride_y + row] = v + res[orow*stride_r + row];
                     } else if constexpr (EPI & W4A16_EPI_F32) {
-                        y[(int64_t) token*stride_y + row] = v;
+                        y[orow*stride_y + row] = v;
                     }
                     if constexpr (EPI & W4A16_EPI_F16) {
-                        y16[(int64_t) token*stride_y16 + row] = __float2half(v);
+                        y16[orow*stride_y16 + row] = __float2half(v);
                     }
                 }
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(w, w_up, x, y, n, m, k, w_row_bytes, stride_y, res, stride_r, y16, stride_y16);
+    GGML_UNUSED_VARS(w, w_up, x, y, n, m, k, w_row_bytes, stride_y, res, stride_r, y16, stride_y16, ida);
     NO_DEVICE_CODE;
 #endif // W4A16_DEVICE
 }
@@ -767,4 +809,192 @@ void ggml_cuda_mul_mat_w4a16(ggml_backend_cuda_context & ctx, const ggml_tensor 
             src0->nb[1], stream);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Routed MoE variant (MUL_MAT_ID), on by default (GGML_HIP_W4A16_MOE=0 disables).
+// Idea after gufo PR #299 (github.com/gufo-org/gufo, MIT): Flash-Next's routed F16 WMMA expert GEMM
+// (src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp, RoutedCompact / RoutedF16GEMMKernel): slots compacted
+// by expert, an (expert | tile << 16) map so empty tiles launch nothing, row tiles of one token tile adjacent in
+// dispatch order. gufo builds the map on the host from counts read back once per layer; here it is built on the
+// device from mm_ids_helper's expert bounds (no sync, CUDA-graph safe), and the GEMM body is the dense W4A16 kernel.
+
+int ggml_cuda_w4a16_moe_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_HIP_W4A16_MOE");
+        return e ? atoi(e) : 1;
+    }();
+    return mode;
+}
+
+// Tile: 128 weight rows x 64 tokens, 4x2 waves. Fastest of 8 configs measured on qwen3.6-35b (128x32, 256x32,
+// 64x32 and single-wave-column variants: 1-10 % slower kernel time; results/2026-09-28-moe-w4a16/NOTES.md).
+static constexpr int W4A16_ID_BM = 128, W4A16_ID_BN = 64, W4A16_ID_WM = 4, W4A16_ID_WN = 2;
+
+static __global__ void w4a16_id_tiles(const int32_t * __restrict__ bounds, int32_t * __restrict__ tiles,
+                                      const int n_experts, const int bn) {
+    __shared__ int s[1024];
+    const int e   = threadIdx.x;
+    const int cnt = e < n_experts ? bounds[e + 1] - bounds[e] : 0;
+    const int nt  = (cnt + bn - 1)/bn;
+    s[e] = nt;
+    __syncthreads();
+    for (int off = 1; off < (int) blockDim.x; off <<= 1) {
+        const int v = e >= off ? s[e - off] : 0;
+        __syncthreads();
+        s[e] += v;
+        __syncthreads();
+    }
+    const int start = s[e] - nt;
+    for (int j = 0; j < nt; ++j) {
+        tiles[1 + start + j] = e | (j << 16);
+    }
+    if (e == (int) blockDim.x - 1) {
+        tiles[0] = s[e];
+    }
+}
+
+bool ggml_cuda_should_use_w4a16_id(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+                                   const ggml_tensor * dst, int cc) {
+    if (ggml_cuda_w4a16_moe_mode() != 1 || !GGML_CUDA_CC_IS_RDNA3_5(cc) || ids == nullptr) {
+        return false;
+    }
+    switch (src0->type) {
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (src1->ne[2] < ggml_cuda_w4a16_min_batch()) { // n_tokens
+        return false;
+    }
+    if (src0->ne[0] % 256 != 0 || src0->nb[0] != ggml_type_size(src0->type) || src0->ne[3] != 1 ||
+            src1->ne[3] != 1 || src1->nb[0] != sizeof(float) || src1->nb[2] % src1->nb[1] != 0 ||
+            dst->nb[0] != sizeof(float) || dst->nb[2] != dst->ne[1]*dst->nb[1]) {
+        return false;
+    }
+    if (src0->ne[2] > 1024 || ids->ne[0] != dst->ne[1] || ids->nb[0] != sizeof(int32_t) ||
+            src1->ne[2]*ids->ne[0] >= (1 << 22) || src0->ne[1] > INT_MAX/2) {
+        return false;
+    }
+    return true;
+}
+
+template <bool PAIRED>
+static void w4a16_id_launch(const ggml_type type, const char * w, const char * w_up, const short * x, float * y,
+        const int m, const int k, const int64_t nb01, const int64_t stride_y, const w4a16_id_args & ida,
+        const int max_tiles, cudaStream_t stream) {
+    constexpr int BM = W4A16_ID_BM, BN = W4A16_ID_BN, WM = W4A16_ID_WM, WN = W4A16_ID_WN;
+    const dim3 grid((m + (PAIRED ? BM/2 : BM) - 1)/(PAIRED ? BM/2 : BM), max_tiles);
+    const dim3 block(WM*WN*32);
+    switch (type) {
+#define W4A16_ID_CASE(T) case T: mul_mat_w4a16<BM, BN, WM, WN, T, 0, PAIRED, W4A16_EPI_F32, true><<<grid, block, 0, stream>>>( \
+        w, w_up, x, y, 0, m, k, nb01, stride_y, nullptr, 0, nullptr, 0, ida); break
+        W4A16_ID_CASE(GGML_TYPE_IQ4_XS);
+        W4A16_ID_CASE(GGML_TYPE_Q4_0);
+        W4A16_ID_CASE(GGML_TYPE_Q8_0);
+        W4A16_ID_CASE(GGML_TYPE_Q4_K);
+        W4A16_ID_CASE(GGML_TYPE_Q5_K);
+        W4A16_ID_CASE(GGML_TYPE_Q6_K);
+#undef W4A16_ID_CASE
+        default: GGML_ABORT("unsupported type");
+    }
+}
+
+// src0 [k, m_total, n_expert]; rows [0, m) (or gate rows [0, m) + up rows [m, 2m) when PAIRED) of each expert.
+template <bool PAIRED>
+static void w4a16_id_run(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                         const ggml_tensor * ids, float * y, const int64_t stride_y, const int m) {
+    cudaStream_t stream = ctx.stream();
+    const int64_t k        = src0->ne[0];
+    const int64_t n_expert = src0->ne[2];
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_tokens = src1->ne[2];
+    const int64_t ne11     = src1->ne[1];
+    const int64_t n_slots  = n_tokens*n_used;
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_slots);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_slots);
+    ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_expert + 1);
+    // activation row of a slot, in units of src1 rows: it*sis1 + iex % ne11 (x16 below is [n_tokens][ne11][k])
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
+        n_expert, n_tokens, n_used, ne11, ids->nb[1]/sizeof(int32_t), ne11, /*write_inverse =*/ false, stream);
+    CUDA_CHECK(cudaGetLastError());
+
+    ggml_cuda_pool_alloc<half> x16(ctx.pool(), (size_t) (n_tokens*ne11*k));
+    ggml_get_to_fp16_nc_cuda(GGML_TYPE_F32)(src1->data, x16.get(), k, ne11, n_tokens, 1,
+        src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float), stream);
+
+    const int bn        = W4A16_ID_BN;
+    const int max_tiles = (int) (n_slots/bn + std::min<int64_t>(n_expert, n_slots) + 1);
+    ggml_cuda_pool_alloc<int32_t> tiles(ctx.pool(), 1 + max_tiles);
+    w4a16_id_tiles<<<1, (unsigned) GGML_PAD(n_expert, 32), 0, stream>>>(bounds.get(), tiles.get(), (int) n_expert, bn);
+    CUDA_CHECK(cudaGetLastError());
+
+    const w4a16_id_args ida = { tiles.get(), bounds.get(), ids_src1.get(), ids_dst.get(), (int64_t) src0->nb[2] };
+    const char * w    = (const char *) src0->data;
+    const char * w_up = PAIRED ? w + (int64_t) m*src0->nb[1] : nullptr;
+    w4a16_id_launch<PAIRED>(src0->type, w, w_up, (const short *) x16.get(), y, m, k, src0->nb[1], stride_y, ida,
+        max_tiles, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_mul_mat_id_w4a16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                const ggml_tensor * ids, ggml_tensor * dst) {
+    static bool logged = false;
+    if (!logged) {
+        GGML_LOG_INFO("%s: W4A16 routed MoE prefill path active (%s, tokens=%lld)\n", __func__,
+            ggml_type_name(src0->type), (long long) src1->ne[2]);
+        logged = true;
+    }
+    w4a16_id_run<false>(ctx, src0, src1, ids, (float *) dst->data, dst->nb[1]/sizeof(float), (int) src0->ne[1]);
+}
+
+bool ggml_cuda_can_fuse_w4a16_id_swiglu(const ggml_tensor * gate_up, const ggml_tensor * gate, const ggml_tensor * up,
+                                        const ggml_tensor * glu, int cc) {
+    static const bool nofuse = getenv("GGML_HIP_W4A16_MOE_NOFUSE") != nullptr && atoi(getenv("GGML_HIP_W4A16_MOE_NOFUSE")) != 0;
+    if (ggml_cuda_w4a16_moe_mode() != 1 || nofuse) {
+        return false;
+    }
+    if (gate_up->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+            ggml_get_op_params_i32(glu, 1) != 0) { // not swapped
+        return false;
+    }
+    if (glu->src[0] != gate || glu->src[1] != up || gate->view_src != gate_up || up->view_src != gate_up) {
+        return false;
+    }
+    const int64_t n_ff = gate_up->ne[0]/2;
+    if (gate_up->ne[0] != 2*n_ff || gate->ne[0] != n_ff || up->ne[0] != n_ff || gate->view_offs != 0 ||
+            up->view_offs != (size_t) n_ff*sizeof(float) || gate->nb[1] != gate_up->nb[1] || up->nb[1] != gate_up->nb[1] ||
+            gate->nb[2] != gate_up->nb[2] || up->nb[2] != gate_up->nb[2] || !ggml_are_same_shape(gate, up)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(glu) || glu->type != GGML_TYPE_F32 || !ggml_are_same_shape(glu, gate)) {
+        return false;
+    }
+    const ggml_tensor * w = gate_up->src[0];
+    if (w->ne[1] != 2*n_ff || n_ff % 64 != 0) {
+        return false;
+    }
+    return ggml_cuda_should_use_w4a16_id(w, gate_up->src[1], gate_up->src[2], gate_up, cc);
+}
+
+void ggml_cuda_mul_mat_id_w4a16_swiglu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_up, ggml_tensor * glu) {
+    static bool logged = false;
+    const ggml_tensor * w = gate_up->src[0];
+    if (!logged) {
+        GGML_LOG_INFO("%s: W4A16 routed MoE fused gate_up/SwiGLU path active (%s, tokens=%lld)\n", __func__,
+            ggml_type_name(w->type), (long long) gate_up->src[1]->ne[2]);
+        logged = true;
+    }
+    w4a16_id_run<true>(ctx, w, gate_up->src[1], gate_up->src[2], (float *) glu->data, glu->nb[1]/sizeof(float),
+        (int) (w->ne[1]/2));
 }

@@ -1980,6 +1980,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             ggml_cuda_mul_mat_id_mmb(ctx, src0, src1, ids, dst);
             return;
         }
+        if (ggml_cuda_should_use_w4a16_id(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mul_mat_id_w4a16(ctx, src0, src1, ids, dst);
+            return;
+        }
+
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
@@ -4493,6 +4498,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mul_mat_w4a16(*cuda_ctx, node->src[0], node->src[1], cgraph->nodes[add_idx], residual);
                 return add_idx - i;
             }
+        }
+    }
+
+    // W4A16 routed MoE lever: merged gate_up MUL_MAT_ID + its two views + SwiGLU in one kernel (default on, GGML_HIP_W4A16_MOE=0 disables)
+    if (node->op == GGML_OP_MUL_MAT_ID && i + 3 < cgraph->n_nodes && ggml_cuda_w4a16_moe_mode() == 1 &&
+            cgraph->nodes[i + 1]->op == GGML_OP_VIEW && cgraph->nodes[i + 2]->op == GGML_OP_VIEW &&
+            cgraph->nodes[i + 3]->op == GGML_OP_GLU) {
+        ggml_tensor * glu = cgraph->nodes[i + 3];
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (ggml_cuda_can_fuse_w4a16_id_swiglu(node, glu->src[0], glu->src[1], glu, cc) &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU }, { i + 3 })) {
+            ggml_cuda_mul_mat_id_w4a16_swiglu(*cuda_ctx, node, glu);
+            return 3;
         }
     }
 

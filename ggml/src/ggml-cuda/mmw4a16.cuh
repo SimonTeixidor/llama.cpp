@@ -39,3 +39,16 @@ void ggml_cuda_w4a16_norm_f16(ggml_backend_cuda_context & ctx, const ggml_tensor
 // dst = down(silu(gate(src1)) * up(src1)) [+ residual], the SwiGLU output only ever exists as FP16.
 void ggml_cuda_mul_mat_w4a16_ffn(ggml_backend_cuda_context & ctx, const ggml_tensor * w_gate, const ggml_tensor * w_up,
                                  const ggml_tensor * src1, const ggml_tensor * w_down, ggml_tensor * dst, const ggml_tensor * residual);
+
+// Routed (MUL_MAT_ID) variant for MoE prefill, on by default (GGML_HIP_W4A16_MOE=0 disables, independent of
+// GGML_HIP_W4A16_PREFILL; GGML_HIP_W4A16_MOE_NOFUSE=1 keeps the routed GEMM but not the fused gate_up/SwiGLU). Routing idea after gufo PR #299 / Flash-Next RoutedF16Gemm (MIT): slots compacted
+// by expert, (expert, token tile) map so no block is launched for an empty tile.
+int  ggml_cuda_w4a16_moe_mode();
+bool ggml_cuda_should_use_w4a16_id(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+                                   const ggml_tensor * dst, int cc);
+void ggml_cuda_mul_mat_id_w4a16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                const ggml_tensor * ids, ggml_tensor * dst);
+// merged gate_up expert tensor [k, 2*n_ff, n_expert]: dst = silu(gate) * up, [n_ff, n_used, n_tokens]
+bool ggml_cuda_can_fuse_w4a16_id_swiglu(const ggml_tensor * gate_up, const ggml_tensor * gate, const ggml_tensor * up,
+                                        const ggml_tensor * glu, int cc);
+void ggml_cuda_mul_mat_id_w4a16_swiglu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_up, ggml_tensor * glu);
