@@ -12777,6 +12777,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //    }
     //}
 
+    // W4A16 prefill GEMM (RDNA3.5 default, GGML_HIP_W4A16_PREFILL=0 disables): gate+up+SwiGLU fused at prefill batch sizes, dense 2D.
+    // Large and CPU-expensive, so only with TBO_W4A16_CASES=1 (keeps the default grid's reference counts).
+    if (getenv("TBO_W4A16_CASES") != nullptr) {
+        for (int64_t tokens : {512, 1037}) {
+            for (int64_t rows : {17408, 5120 - 64, 5120 - 3}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ4_XS, GGML_GLU_OP_SWIGLU, tokens, rows, 5120,
+                    false, 16, 8, false, false, true, false, { 1, 1 }));
+            }
+        }
+    }
+
     // Both sides of the same row-count boundary as above, on the fused path.
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,

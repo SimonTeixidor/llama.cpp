@@ -30,6 +30,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmw4a16.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -1536,6 +1537,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
         prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && ggml_cuda_w4a16_mode() == 3 && ggml_is_quantized(src0->type)) {
+            prefer_f32_output = true; // prefill lever mode 3: FP16 inputs, FP32 accumulation
+        }
     } else if (compute_type == GGML_TYPE_BF16) {
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
@@ -1898,6 +1902,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_mmb_supported_mm(ctx, src0, src1, dst)) {
         ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
+        return;
+    }
+    if (ggml_cuda_should_use_w4a16(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_w4a16(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
@@ -4324,6 +4332,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // W4A16 prefill lever: gate + up + SwiGLU in one kernel (default on, GGML_HIP_W4A16_PREFILL=0 disables; large batch only)
+    if (node->op == GGML_OP_MUL_MAT && i + 2 < cgraph->n_nodes && ggml_cuda_w4a16_mode() == 1 &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+        ggml_tensor * glu = cgraph->nodes[i + 2];
+        ggml_tensor * n0  = cgraph->nodes[i];
+        ggml_tensor * n1  = cgraph->nodes[i + 1];
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * up   = nullptr;
+        if (glu->src[0] == n0 && glu->src[1] == n1) {
+            gate = n0; up = n1;
+        } else if (glu->src[0] == n1 && glu->src[1] == n0) {
+            gate = n1; up = n0;
+        }
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (gate && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                ggml_cuda_should_fuse_mul_mat(up, gate, glu) &&
+                gate->src[0]->type == up->src[0]->type &&
+                ggml_is_contiguous(glu) && ggml_are_same_shape(glu, up) &&
+                ggml_cuda_should_use_w4a16(up->src[0], up->src[1], up, cc) &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { i + 2 })) {
+            const int out_nodes[] = { i + 2 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
+                ggml_cuda_mul_mat_w4a16_swiglu(*cuda_ctx, gate->src[0], up->src[0], up->src[1], glu);
+                return 2;
+            }
+        }
+    }
+
     // qwen4exp prefill convolutions: the concat writes only the columns its history copies read, and one kernel
     // replaces the tap chain (PLE) or the ssm_conv + SiLU (Gated DeltaNet). Both decisions come from the same matcher.
     if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_CONT) {
@@ -5806,6 +5842,54 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// Dev-only per-op timer (GGML_W4A16_OPPROF=1, needs GGML_CUDA_DISABLE_GRAPHS=1): hipEvent pair around every
+// node or fused group on the main stream, synchronised per node, aggregated by op (+ weight type) and printed at exit.
+struct ggml_cuda_op_prof {
+    std::map<std::string, std::pair<double, int64_t>> acc;
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    static bool enabled() {
+        static const bool on = getenv("GGML_W4A16_OPPROF") != nullptr;
+        return on;
+    }
+    void begin(cudaStream_t st) {
+        if (!e0) { CUDA_CHECK(cudaEventCreateWithFlags(&e0, 0)); CUDA_CHECK(cudaEventCreateWithFlags(&e1, 0)); }
+        CUDA_CHECK(cudaEventRecord(e0, st));
+    }
+    void end(cudaStream_t st, const ggml_tensor * node, int n_fused) {
+        CUDA_CHECK(cudaEventRecord(e1, st));
+        CUDA_CHECK(cudaEventSynchronize(e1));
+        float ms = 0.0f;
+#ifdef GGML_USE_HIP
+        CUDA_CHECK(hipEventElapsedTime(&ms, e0, e1));
+#else
+        CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+#endif
+        std::string key = ggml_op_name(node->op);
+        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]) {
+            key += std::string("/") + ggml_type_name(node->src[0]->type) + (node->src[1] && node->src[1]->ne[1] > 16 ? "/big" : "/small");
+        }
+        if (node->op == GGML_OP_UNARY) key += std::string("/") + ggml_unary_op_name(ggml_get_unary_op(node));
+        if (node->op == GGML_OP_GLU)   key += std::string("/") + ggml_glu_op_name(ggml_get_glu_op(node));
+        if (n_fused > 0) key += "+fused" + std::to_string(n_fused);
+        auto & a = acc[key];
+        a.first += ms;
+        a.second++;
+    }
+    ~ggml_cuda_op_prof() {
+        if (acc.empty()) return;
+        double tot = 0;
+        for (auto & kv : acc) tot += kv.second.first;
+        std::vector<std::pair<std::string, std::pair<double, int64_t>>> v(acc.begin(), acc.end());
+        std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.first > b.second.first; });
+        fprintf(stderr, "OPPROF total %.1f ms\n", tot);
+        for (auto & kv : v) {
+            fprintf(stderr, "OPPROF %-40s %10.1f ms %6.2f %% %8lld calls\n", kv.first.c_str(), kv.second.first,
+                100.0*kv.second.first/tot, (long long) kv.second.second);
+        }
+    }
+};
+static ggml_cuda_op_prof g_ggml_cuda_op_prof;
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5946,7 +6030,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                const bool op_prof = ggml_cuda_op_prof::enabled() && !use_cuda_graph && !is_concurrent_event_active;
+                if (op_prof) {
+                    g_ggml_cuda_op_prof.begin(cuda_ctx->stream());
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (op_prof && nodes_to_skip != 0) {
+                    g_ggml_cuda_op_prof.end(cuda_ctx->stream(), node, nodes_to_skip);
+                }
 
                 if (nodes_to_skip == GGML_CUDA_FUSED_SELF) {
                     continue;
@@ -5983,6 +6074,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (op_prof) {
+                    g_ggml_cuda_op_prof.end(cuda_ctx->stream(), node, 0);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);

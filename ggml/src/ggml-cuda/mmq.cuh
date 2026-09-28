@@ -1942,3 +1942,12 @@ void ggml_cuda_mul_mat_q_swiglu(
 void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+
+// GGML_HIP_W4A16_PREFILL: prefill GEMM selection on RDNA3.5 (default 1 = on).
+//   0 = off: stock MMQ / hipBLAS routing (A/B off-switch)
+//   1 = in-kernel W4A16 GEMM (FP16 WMMA, FP32 accumulation) for supported types, RDNA3.5 only (default)
+//   2 = force dequantize-to-FP16 + hipBLAS (stock RDNA3 route: FP16 accumulation)
+//   3 = force dequantize-to-FP16 + hipBLAS with FP32 accumulation/output
+// GGML_HIP_W4A16_MIN_BATCH: minimum ne11 (tokens) for the lever to fire (default 512).
+int     ggml_cuda_w4a16_mode();
+int64_t ggml_cuda_w4a16_min_batch();

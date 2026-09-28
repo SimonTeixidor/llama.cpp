@@ -461,6 +461,22 @@ void ggml_cuda_mul_mat_q_swiglu(
 }
 
 
+int ggml_cuda_w4a16_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_HIP_W4A16_PREFILL");
+        return e ? atoi(e) : 1;
+    }();
+    return mode;
+}
+
+int64_t ggml_cuda_w4a16_min_batch() {
+    static const int64_t n = [] {
+        const char * e = getenv("GGML_HIP_W4A16_MIN_BATCH");
+        return e ? (int64_t) atoll(e) : (int64_t) 512;
+    }();
+    return n;
+}
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
@@ -552,6 +568,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (amd_wmma_available(cc)) {
+        // prefill lever, modes 2/3: route dense large-batch quantized matmuls to dequant + hipBLAS
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && n_experts == 0 && ne11 >= ggml_cuda_w4a16_min_batch() &&
+                (ggml_cuda_w4a16_mode() == 2 || ggml_cuda_w4a16_mode() == 3)) {
+            return false;
+        }
         if (GGML_CUDA_CC_IS_RDNA3(cc)) {
             // High expert counts are almost always better on MMQ due to
             //     the synchronization overhead in the cuBLAS/hipBLAS path:
