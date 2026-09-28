@@ -1151,7 +1151,15 @@ void launch_fattn(
             return tiles_efficiency_percent < 75;
         };
 
-        const int  max_blocks   = max_blocks_per_sm*nsm;
+        // RDNA3.5 prefill (>= 512 query rows): 4x more stream-k blocks than the occupancy query allows. qwen3.6-35b
+        // pp4096 at ub 4096 +3.6 % (x2: +3.2 %), results/2026-09-28-moe-prefill2/. Smaller batches (decode, spec verify)
+        // keep x1. GGML_HIP_FA_SK_MULT=N overrides the multiplier for prefill (1 = off).
+        static const int sk_mult_env = [] {
+            const char * e = getenv("GGML_HIP_FA_SK_MULT");
+            return e ? std::max(1, atoi(e)) : 0;
+        }();
+        const int  sk_mult      = GGML_CUDA_CC_IS_RDNA3_5(cc) && Q->ne[1] >= 512 ? (sk_mult_env ? sk_mult_env : 4) : 1;
+        const int  max_blocks   = max_blocks_per_sm*nsm*sk_mult;
         const bool use_stream_k = should_use_stream_k(cc, ntiles_dst, max_blocks, Q->ne[0]);
 
         blocks_num.x = ntiles_dst;

@@ -12963,6 +12963,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // qwen35moe prefill FA shapes (D=256, 2 KV heads, GQA 8) at ub 2048/4096, for the RDNA3.5 prefill stream-k
+    // multiplier. Only with TBO_FA_PREFILL_CASES=1 (CPU reference is slow).
+    if (getenv("TBO_FA_PREFILL_CASES") != nullptr) {
+        for (auto kvnb : std::vector<std::pair<int64_t, int64_t>>{{2048, 2048}, {4096, 4096}, {4096, 2048}, {4096, 1000}, {6144, 2048}}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kvnb.first, kvnb.second, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // Both sides of the same row-count boundary as above, on the fused path.
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
