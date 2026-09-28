@@ -4298,6 +4298,57 @@ static uint16_t * ggml_cuda_bf16_for_mmb_reader(ggml_backend_cuda_context & ctx,
     return nullptr;
 }
 
+// GGML_HIP_W4A16_RESADD: the matmul at node i is followed by pure reshapes/views of its output (qwen35 ssm_out has a
+// reshape_2d) and then an ADD of that output and a residual. Returns the ADD's index (and the residual), or -1.
+// Intermediates must have exactly one use each (the next node in the chain) and not be graph outputs.
+// The fused kernel reads its activations from an FP16 copy made before it runs and the weights are constant, so the
+// only in-kernel hazard is the residual: allowed if it is exactly the ADD's own storage (element-wise, same lane
+// reads then writes, as ggml-alloc produces for an in-place ADD) or disjoint from it.
+static int ggml_cuda_w4a16_match_resadd(const ggml_cgraph * cgraph, const int i, const ggml_tensor ** residual) {
+    const ggml_tensor * mm  = cgraph->nodes[i];
+    const ggml_tensor * cur = mm;
+    if (mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || mm->ne[2] != 1 || mm->ne[3] != 1) {
+        return -1;
+    }
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 4; ++j) {
+        if ((cur->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, j - 1) != 1) {
+            return -1;
+        }
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) {
+            if (n->src[0] != cur || n->view_src != mm || n->view_offs != 0 || !ggml_is_contiguous(n) ||
+                    n->ne[0] != mm->ne[0] || ggml_nelements(n) != ggml_nelements(mm)) {
+                return -1;
+            }
+            cur = n;
+            continue;
+        }
+        if (n->op != GGML_OP_ADD || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return -1;
+        }
+        const ggml_tensor * r = n->src[0] == cur ? n->src[1] : (n->src[1] == cur ? n->src[0] : nullptr);
+        if (r == nullptr || r == cur) {
+            return -1;
+        }
+        if (n->type != GGML_TYPE_F32 || r->type != GGML_TYPE_F32 || !ggml_are_same_shape(n, cur) || !ggml_are_same_shape(n, r) ||
+                n->ne[1] != mm->ne[1] || n->nb[0] != sizeof(float) || r->nb[0] != sizeof(float) ||
+                !ggml_is_contiguous_rows(n) || !ggml_is_contiguous_rows(r)) {
+            return -1;
+        }
+        const char * d0 = (const char *) n->data;
+        const char * d1 = d0 + ggml_nbytes(n);
+        const char * r0 = (const char *) r->data;
+        const char * r1 = r0 + ggml_nbytes(r);
+        const bool same = d0 == r0 && n->nb[1] == r->nb[1];
+        if (!same && d0 < r1 && r0 < d1) {
+            return -1;
+        }
+        *residual = r;
+        return j;
+    }
+    return -1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4332,6 +4383,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // W4A16 prefill lever, GGML_HIP_W4A16_F16ACT bit 2: RMS_NORM+MUL also writes the FP16 copy of its output into the
+    // activation cache, when a later W4A16 GEMM in this graph reads that output (gufo prefill_norm.hip writes FP16).
+    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes && (ggml_cuda_w4a16_f16act() & 2) &&
+            cuda_ctx->curr_stream_no == 0 && ggml_cuda_w4a16_can_norm_f16(node, cgraph->nodes[i + 1]) &&
+            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        bool has_w4a16_consumer = false;
+        for (int j = i + 2; j < cgraph->n_nodes && j < i + 64 && !has_w4a16_consumer; ++j) {
+            const ggml_tensor * c = cgraph->nodes[j];
+            has_w4a16_consumer = c->op == GGML_OP_MUL_MAT && c->src[1] == mul && c->src[2] == nullptr &&
+                ggml_cuda_should_use_w4a16(c->src[0], mul, c, cc);
+        }
+        if (has_w4a16_consumer) {
+            ggml_cuda_w4a16_norm_f16(*cuda_ctx, node, mul);
+            return 1;
+        }
+    }
+
     // W4A16 prefill lever: gate + up + SwiGLU in one kernel (default on, GGML_HIP_W4A16_PREFILL=0 disables; large batch only)
     if (node->op == GGML_OP_MUL_MAT && i + 2 < cgraph->n_nodes && ggml_cuda_w4a16_mode() == 1 &&
             cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
@@ -4352,6 +4422,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_is_contiguous(glu) && ggml_are_same_shape(glu, up) &&
                 ggml_cuda_should_use_w4a16(up->src[0], up->src[1], up, cc) &&
                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { i + 2 })) {
+            // GGML_HIP_W4A16_F16ACT bit 4: extend to [gate, up, GLU, down (, ADD)], the SwiGLU output only as FP16.
+            // No generic memory-range check here: the kernels run in stream order, the SwiGLU tensor is never
+            // written, and down's output may legitimately reuse the (by then dead) norm output's memory.
+            if ((ggml_cuda_w4a16_f16act() & 4) && i + 3 < cgraph->n_nodes) {
+                ggml_tensor * down = cgraph->nodes[i + 3];
+                if (down->op == GGML_OP_MUL_MAT && down->src[1] == glu && down->src[2] == nullptr &&
+                        ggml_is_contiguous(glu) && ggml_cuda_should_use_w4a16(down->src[0], glu, down, cc) &&
+                        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 3 })) {
+                    const ggml_tensor * residual = nullptr;
+                    const int add_idx = ggml_cuda_w4a16_resadd() ? ggml_cuda_w4a16_match_resadd(cgraph, i + 3, &residual) : -1;
+                    if (add_idx > 0) {
+                        ggml_cuda_mul_mat_w4a16_ffn(*cuda_ctx, gate->src[0], up->src[0], up->src[1], down->src[0],
+                            cgraph->nodes[add_idx], residual);
+                        return add_idx - i;
+                    }
+                    ggml_cuda_mul_mat_w4a16_ffn(*cuda_ctx, gate->src[0], up->src[0], up->src[1], down->src[0], down, nullptr);
+                    return 3;
+                }
+            }
             const int out_nodes[] = { i + 2 };
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
                 ggml_cuda_mul_mat_w4a16_swiglu(*cuda_ctx, gate->src[0], up->src[0], up->src[1], glu);
@@ -4393,7 +4482,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-
+    // GGML_HIP_W4A16_RESADD: [MUL_MAT, (reshape/view)*, ADD(residual)] -> one W4A16 GEMM with y = acc + residual
+    // (gufo fuses its residual adds into the GEMM epilogue, prefill_residual.hip / prefill_chunk.cpp).
+    if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_w4a16_resadd() && i + 1 < cgraph->n_nodes) {
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (ggml_cuda_should_use_w4a16(node->src[0], node->src[1], node, cc)) {
+            const ggml_tensor * residual = nullptr;
+            const int add_idx = ggml_cuda_w4a16_match_resadd(cgraph, i, &residual);
+            if (add_idx > 0) {
+                ggml_cuda_mul_mat_w4a16(*cuda_ctx, node->src[0], node->src[1], cgraph->nodes[add_idx], residual);
+                return add_idx - i;
+            }
+        }
+    }
 
     // RDNA3.5 decode: consecutive single-column MUL_MATs that read the same activation vector (plain Q8_0/F32
     // matvecs, or a [mul_mat, mul_mat, glu] gate/up pair) are launched as one grouped kernel. The segments are
@@ -5926,6 +6027,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
+            // W4A16 FP16 activation cache is per graph evaluation (tensor contents change between evaluations)
+            ggml_cuda_w4a16_x16_reset(*cuda_ctx);
+
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
@@ -6034,7 +6138,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (op_prof) {
                     g_ggml_cuda_op_prof.begin(cuda_ctx->stream());
                 }
+                if (cuda_ctx->w4a16_x16.key != nullptr) {
+                    ggml_cuda_w4a16_x16_note_write(*cuda_ctx, node);
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (nodes_to_skip != 0 && cuda_ctx->w4a16_x16.key != nullptr) {
+                    // the fused block's output (a norm's own cache key is exempt)
+                    ggml_cuda_w4a16_x16_note_write(*cuda_ctx, cgraph->nodes[i + nodes_to_skip]);
+                }
                 if (op_prof && nodes_to_skip != 0) {
                     g_ggml_cuda_op_prof.end(cuda_ctx->stream(), node, nodes_to_skip);
                 }
@@ -6082,6 +6193,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            ggml_cuda_w4a16_x16_reset(*cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH

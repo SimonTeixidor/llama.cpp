@@ -8039,6 +8039,83 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// W4A16 prefill fusions (GGML_HIP_W4A16_F16ACT / GGML_HIP_W4A16_RESADD) at the real qwen35 shapes. The whole graph runs
+// on the backend, so the fusions fire; only `out` is compared against the CPU.
+//   NORM_SHARE: rms_norm(x)*w -> several matmuls reading it (GDN qkv/gate/beta/alpha, attention q/k/v) -> concat
+//   FFN       : rms_norm(x)*w -> gate, up -> swiglu -> down -> + x   (inplace: ggml_add_inplace(x, down))
+//   RESADD    : h -> matmul [-> reshape_2d] -> + r                   (inplace: ggml_add_inplace(r, .))
+struct test_w4a16_block : public test_case {
+    enum mode_t { NORM_SHARE, FFN, RESADD };
+    const int mode;
+    const int64_t k;    // input features
+    const int64_t n;    // tokens
+    const std::vector<std::pair<ggml_type, int64_t>> mats; // NORM_SHARE: (type, rows); FFN: {gate/up, ff}, {down, -}; RESADD: {type, k_in}
+    const bool inplace;
+    const bool reshape;
+
+    test_w4a16_block(int mode, int64_t k, int64_t n, std::vector<std::pair<ggml_type, int64_t>> mats, bool inplace = false, bool reshape = false)
+        : mode(mode), k(k), n(n), mats(std::move(mats)), inplace(inplace), reshape(reshape) {}
+
+    std::string vars() override {
+        std::string m;
+        for (const auto & [t, r] : mats) {
+            m += std::string(m.empty() ? "" : "+") + ggml_type_name(t) + ":" + std::to_string(r);
+        }
+        return "mode=" + std::to_string(mode) + ",k=" + std::to_string(k) + ",n=" + std::to_string(n) + ",mats=" + m +
+            ",inplace=" + std::to_string(inplace) + ",reshape=" + std::to_string(reshape);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "W4A16_BLOCK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = nullptr;
+        if (mode == NORM_SHARE || mode == FFN) {
+            ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * wn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            ggml_set_name(x, "x");
+            ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), wn);
+            if (mode == NORM_SHARE) {
+                for (const auto & [t, rows] : mats) {
+                    ggml_tensor * w = ggml_new_tensor_2d(ctx, t, k, rows);
+                    ggml_tensor * y = ggml_mul_mat(ctx, w, xn);
+                    out = out ? ggml_concat(ctx, out, y, 0) : y;
+                }
+            } else {
+                GGML_ASSERT(mats.size() == 2);
+                const int64_t ff = mats[0].second;
+                ggml_tensor * wg = ggml_new_tensor_2d(ctx, mats[0].first, k, ff);
+                ggml_tensor * wu = ggml_new_tensor_2d(ctx, mats[0].first, k, ff);
+                ggml_tensor * wd = ggml_new_tensor_2d(ctx, mats[1].first, ff, k);
+                ggml_tensor * up   = ggml_mul_mat(ctx, wu, xn);
+                ggml_tensor * gate = ggml_mul_mat(ctx, wg, xn);
+                ggml_tensor * h    = ggml_swiglu_split(ctx, gate, up);
+                ggml_tensor * down = ggml_mul_mat(ctx, wd, h);
+                out = inplace ? ggml_add_inplace(ctx, x, down) : ggml_add(ctx, down, x);
+            }
+        } else {
+            GGML_ASSERT(mats.size() == 1);
+            const int64_t k_in = mats[0].second;
+            ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_in, n);
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, mats[0].first, k_in, k);
+            ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * y = ggml_mul_mat(ctx, w, h);
+            if (reshape) {
+                y = ggml_reshape_2d(ctx, y, k, n);
+            }
+            out = inplace ? ggml_add_inplace(ctx, r, y) : ggml_add(ctx, y, r);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -12785,6 +12862,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ4_XS, GGML_GLU_OP_SWIGLU, tokens, rows, 5120,
                     false, 16, 8, false, false, true, false, { 1, 1 }));
             }
+        }
+        // W4A16 prefill fusions (GGML_HIP_W4A16_F16ACT / _RESADD), qwen35 27B shapes; n = 1037 covers the token tail
+        const ggml_type IQ4 = GGML_TYPE_IQ4_XS, Q8 = GGML_TYPE_Q8_0, Q6 = GGML_TYPE_Q6_K;
+        for (int64_t tokens : {512, 1037}) {
+            using tbw = test_w4a16_block;
+            // GDN in-projections (ssm_beta/alpha Q8_0 as in the ssmq8 file, m = 48 < one tile), attention q/k/v
+            test_cases.emplace_back(new tbw(tbw::NORM_SHARE, 5120, tokens, {{IQ4, 10240}, {IQ4, 6144}, {Q8, 48}, {Q8, 48}}));
+            test_cases.emplace_back(new tbw(tbw::NORM_SHARE, 5120, tokens, {{IQ4, 12288}, {Q8, 1024}, {Q8, 1024}}));
+            // row tails (m % 256 != 0, m % 4 != 0) and a non-W4A16 consumer (F32 weights -> hipBLAS reads the F32 copy)
+            test_cases.emplace_back(new tbw(tbw::NORM_SHARE, 5120, tokens, {{IQ4, 5120 - 3}, {Q6, 200}, {GGML_TYPE_F32, 48}}));
+            // FFN chain + residual, plain and in-place
+            test_cases.emplace_back(new tbw(tbw::FFN, 5120, tokens, {{IQ4, 17408}, {IQ4, 0}}));
+            test_cases.emplace_back(new tbw(tbw::FFN, 5120, tokens, {{IQ4, 17408}, {Q6, 0}}, true));
+            // residual epilogue: attn_output (k_in 6144), ssm_out with reshape, in-place, row tail
+            test_cases.emplace_back(new tbw(tbw::RESADD, 5120, tokens, {{IQ4, 6144}}));
+            test_cases.emplace_back(new tbw(tbw::RESADD, 5120, tokens, {{IQ4, 6144}}, false, true));
+            test_cases.emplace_back(new tbw(tbw::RESADD, 5120, tokens, {{Q6, 6144}}, true, true));
+            test_cases.emplace_back(new tbw(tbw::RESADD, 5120 - 3, tokens, {{IQ4, 6144}}));
         }
     }
 

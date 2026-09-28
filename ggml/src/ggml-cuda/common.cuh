@@ -1606,6 +1606,31 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // W4A16 prefill lever (GGML_HIP_W4A16_F16ACT, mmw4a16.cu): FP16 copy of one F32 activation tensor, shared by the
+    // W4A16 GEMMs that read it. Valid within one graph evaluation only. Declared after `pools` so it is destroyed
+    // (and returns its buffer) before them.
+    struct w4a16_x16_cache {
+        const ggml_tensor * key  = nullptr;
+        const void *        data = nullptr;
+        int64_t             ne0  = 0;
+        int64_t             ne1  = 0;
+        size_t              nb1  = 0;
+        ggml_cuda_pool *    pool = nullptr;
+        half *              buf  = nullptr;
+        size_t              size = 0;
+
+        void release() {
+            if (buf != nullptr) {
+                pool->free(buf, size);
+            }
+            key  = nullptr;
+            data = nullptr;
+            buf  = nullptr;
+            size = 0;
+        }
+        ~w4a16_x16_cache() { release(); }
+    } w4a16_x16;
 };
 
 struct ggml_cuda_mm_fusion_args_host {
