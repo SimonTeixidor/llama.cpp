@@ -12972,6 +12972,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // qwen35moe prefill GDN shapes (16 qk heads x2 v repeat, S 128, 16..4096 tokens, 1-2 seqs, permuted) for the RDNA3.5
+    // row-split GDN kernel. Only with TBO_GDN_PREFILL_CASES=1.
+    if (getenv("TBO_GDN_PREFILL_CASES") != nullptr) {
+        for (int64_t nt : {16, 17, 100, 1037, 4096}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 2));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, nt, 1, 1));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 2, 2, true));
+            // snapshot slots (MTP: K = n_rs_seq + 1 = 11), incl. n_tokens < K
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 2, false, false, 11));
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, nt, 2, 1, false, false, 4));
+        }
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 16, 1, 2, false, false, 20));
+    }
+
     // Both sides of the same row-count boundary as above, on the fused path.
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
