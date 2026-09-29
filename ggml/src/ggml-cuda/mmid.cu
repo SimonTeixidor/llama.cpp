@@ -70,6 +70,61 @@ static __global__ void mm_ids_helper_512_10(
     }
 }
 
+// RDNA3.5: the same single-block histogram helper for any n_experts <= 1024 and any n_expert_used (qwen35moe: 256 x 8).
+// The warp-per-expert helper scans all n_tokens*n_used slots once per expert, which at ub 4096 measured ~1 ms per call,
+// two calls per layer. The order of slots within an expert differs (atomics), each slot's row and output are the same.
+// GGML_HIP_MMID_HIST=0: back to the warp-per-expert helper.
+__launch_bounds__(1024, 1)
+static __global__ void mm_ids_helper_hist(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
+        int32_t * __restrict__ expert_bounds, const int n_experts, const int n_tokens, const int n_used, const int nchannels_y,
+        const int si1, const int sis1, const bool write_inverse) {
+    __shared__ int counts[1024];
+    __shared__ int cursors[1024];
+    __shared__ int bounds[1025];
+
+    const int tid = threadIdx.x;
+    for (int e = tid; e < n_experts; e += blockDim.x) {
+        counts[e]  = 0;
+        cursors[e] = 0;
+    }
+    __syncthreads();
+
+    const int n_slots = n_tokens * n_used;
+    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
+        const int token = idx / n_used;
+        const int iex   = idx - token * n_used;
+        atomicAdd(&counts[ids[token * si1 + iex]], 1);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int total = 0;
+        bounds[0] = 0;
+        for (int e = 0; e < n_experts; ++e) {
+            total += counts[e];
+            bounds[e + 1] = total;
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e <= n_experts; e += blockDim.x) {
+        expert_bounds[e] = bounds[e];
+    }
+
+    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
+        const int token = idx / n_used;
+        const int iex   = idx - token * n_used;
+        const int expert = ids[token * si1 + iex];
+        const int dst = bounds[expert] + atomicAdd(&cursors[expert], 1);
+        ids_dst[dst] = idx;
+        if (write_inverse) {
+            ids_src1[idx] = dst;
+        } else {
+            ids_src1[dst] = token * sis1 + iex % nchannels_y;
+        }
+    }
+}
+
 // the generic path passes 0, which needs no padding since it never groups lanes by token
 template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
 template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
@@ -207,6 +262,12 @@ void ggml_cuda_launch_mm_ids_helper(
     if (GGML_CUDA_CC_IS_RDNA3_5(cc) && n_experts == 512 && n_expert_used == 10 && getenv("GGML_CUDA_DISABLE_MMID_512") == nullptr) {
         mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
             ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
+        return;
+    }
+    static const bool hist = getenv("GGML_HIP_MMID_HIST") == nullptr || atoi(getenv("GGML_HIP_MMID_HIST")) != 0;
+    if (hist && GGML_CUDA_CC_IS_RDNA3_5(cc) && n_experts <= 1024 && n_tokens < (1 << 22)) {
+        mm_ids_helper_hist<<<1, 1024, 0, stream>>>(
+            ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse);
         return;
     }
     switch (n_expert_used) {
