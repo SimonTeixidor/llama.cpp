@@ -1905,6 +1905,27 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // RDNA3.5: a small float weight (the GDN ssm_alpha/ssm_beta projections, f32 5120x48, ~1 MB) at 9..16 columns
+    // falls past mmvf's 8-column limit and, without fp32 MMA (no mmf), into hipBLAS sgemm at a flat ~90 us per call
+    // against ~5 us for mmvf at 8 columns. Split the columns into <= 8-wide balanced chunks and run mmvf per chunk
+    // instead; the weight is re-read from the LLC, so this is limited to weights of at most 4 MiB.
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && ne11 > MMVF_MAX_BATCH_SIZE && ne11 <= 2*MMVF_MAX_BATCH_SIZE && ne12 == 1 && ne13 == 1
+            && ggml_nbytes(src0) <= (size_t) 4*1024*1024
+            && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, MMVF_MAX_BATCH_SIZE)) {
+        const int64_t nchunks = (ne11 + MMVF_MAX_BATCH_SIZE - 1) / MMVF_MAX_BATCH_SIZE;
+        const int64_t chunk   = (ne11 + nchunks - 1) / nchunks;
+        for (int64_t c0 = 0; c0 < ne11; c0 += chunk) {
+            const int64_t nc = std::min(chunk, ne11 - c0);
+            ggml_tensor src1_c = *src1;
+            ggml_tensor dst_c  = *dst;
+            src1_c.ne[1] = nc;
+            dst_c.ne[1]  = nc;
+            src1_c.data  = (char *) src1->data + c0*src1->nb[1];
+            dst_c.data   = (char *) dst->data  + c0*dst->nb[1];
+            ggml_cuda_mul_mat_vec_f(ctx, src0, &src1_c, nullptr, &dst_c);
+        }
+        return;
+    }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
     if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
             && src0->type == GGML_TYPE_F32
