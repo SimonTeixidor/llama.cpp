@@ -664,7 +664,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33, const int ne01) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -672,6 +672,7 @@ static __global__ void flash_attn_mask_to_KV_max(
     const int tid      = threadIdx.x;
     const int sequence = blockIdx.y;
     const int jt       = blockIdx.x;
+    const int nrows    = min(ncols1, ne01 - jt*ncols1); // the mask has ne01 rows: rows of a partial last tile past it count as masked
 
     mask += sequence*s33 + jt*ncols1*s31;
 
@@ -688,8 +689,10 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
-            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            if (j < nrows) {
+                const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            }
         }
 
         all_inf = warp_reduce_all(all_inf);
@@ -1109,7 +1112,9 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // RDNA3.5: also for small batches (speculative verify, MTP draft), so that the masked n_kv padding cells are neither
+    //     read nor computed. Measured on gfx1151 (qwen3.8-27b, 24k, 2026-10-03): -16 % per FA call with 4096 padded cells.
+    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || GGML_CUDA_CC_IS_RDNA3_5(cc))) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1122,7 +1127,7 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, int(Q->ne[1]));
         CUDA_CHECK(cudaGetLastError());
     }
 
