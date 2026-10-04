@@ -159,7 +159,10 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     // The stock ncols=16 config (64, 2, 32, 128, 128, 128, 1, true) spills 277 VGPRs / 724 B scratch on gfx1151; this one 84.
     // Measured on gfx1151 (D=256 GQA 6 verify at 5-8 rows, 24k KV, 2026-10-03): 668-682 us per call against 959-967 us.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32,  64,  32,  32, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
+    // ncols=32 is the GQA-6 spec-verify batch of 9-16 tokens. The upstream config (128, 2, 64, 128, 128, 64, 1, true) spills
+    // 423 VGPRs on gfx1151. Measured on gfx1151 (24k KV, 2026-10-03): 747-766 us per call, against 1100-1131 us for a
+    // 256-thread no-spill config (256, 1, 64, 64, 32, 32, 1, false); the upstream config was not timed against it.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 1,  64,  64,  32,  32, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  32, 128,  64,  64, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
