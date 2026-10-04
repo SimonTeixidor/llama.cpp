@@ -4768,6 +4768,75 @@ static int ggml_cuda_w4a16_match_resadd(const ggml_cgraph * cgraph, const int i,
     return -1;
 }
 
+// RDNA3.5: a run of CPY nodes (only no-op view nodes in between) that share type, ne and nb and differ only in their
+// data pointers runs as one launch. Target: the K = n_rs_seq + 1 conv-state snapshot copies per delta-net layer that
+// build_conv_state emits (768 copies per qwen35 verify at n_rs_seq 15). The copies must be independent: no destination
+// may overlap any source or another destination.
+static int ggml_cuda_try_batch_cpy(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * first = cgraph->nodes[i];
+    if (first->op != GGML_OP_CPY || cuda_ctx->curr_stream_no != 0 ||
+            !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        return 0;
+    }
+    const ggml_tensor * s0 = first->src[0];
+    const ggml_tensor * d0 = first->src[1];
+    if (!ggml_cuda_cpy_batched_supported(s0, d0)) {
+        return 0;
+    }
+
+    const ggml_tensor * srcs[64];
+    const ggml_tensor * dsts[64];
+    int n    = 0;
+    int last = i;
+    for (int j = i; j < cgraph->n_nodes && n < 64; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (j > i && ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_CPY || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            break;
+        }
+        const ggml_tensor * s = node->src[0];
+        const ggml_tensor * d = node->src[1];
+        if (s->type != s0->type || d->type != d0->type) {
+            break;
+        }
+        bool same = true;
+        for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+            same = same && s->ne[k] == s0->ne[k] && s->nb[k] == s0->nb[k] && d->ne[k] == d0->ne[k] && d->nb[k] == d0->nb[k];
+        }
+        if (!same) {
+            break;
+        }
+        // independence: this destination must not overlap any earlier source or destination, and this source must not
+        // overlap any earlier destination (the batched launch has no order between copies)
+        const char * ds = (const char *) d->data;
+        const char * de = ds + ggml_nbytes(d);
+        const char * ss = (const char *) s->data;
+        const char * se = ss + ggml_nbytes(s);
+        bool indep = true;
+        for (int k = 0; k < n && indep; ++k) {
+            const char * pds = (const char *) dsts[k]->data;
+            const char * pde = pds + ggml_nbytes(dsts[k]);
+            const char * pss = (const char *) srcs[k]->data;
+            const char * pse = pss + ggml_nbytes(srcs[k]);
+            indep = !(ds < pde && pds < de) && !(ds < pse && pss < de) && !(ss < pde && pds < se);
+        }
+        if (!indep || (ds < se && ss < de)) {
+            break;
+        }
+        srcs[n] = s;
+        dsts[n] = d;
+        ++n;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    ggml_cuda_cpy_batched(*cuda_ctx, srcs, dsts, n);
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4906,6 +4975,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 s_precomputed[r] = sk;
             }
             break;
+        }
+    }
+
+    if (node->op == GGML_OP_CPY) {
+        const int n_skip = ggml_cuda_try_batch_cpy(cuda_ctx, cgraph, i);
+        if (n_skip > 0) {
+            return n_skip;
         }
     }
 

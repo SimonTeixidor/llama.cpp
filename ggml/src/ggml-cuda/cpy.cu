@@ -623,3 +623,74 @@ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     ggml_cuda_cpy(ctx, src0, dst);
 }
+
+
+// Batched copy: n independent copies that share type, shape and strides (only their base pointers differ)
+// run as one launch, blockIdx.y selecting the copy. Used for the K conv-state snapshot copies per delta-net layer.
+template <typename T>
+static __global__ void cpy_scalar_batched(const char * cx, char * cdst, const ggml_cuda_cpy_batch_offs offs, const int64_t ne,
+                                          const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+                                          const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+                                          const int64_t nb12, const int64_t nb13) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= ne) {
+        return;
+    }
+    const int b = blockIdx.y;
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02 )/ (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02  -  i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03 * nb03;
+
+    const int64_t i13 = i/(ne10 * ne11 * ne12);
+    const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+    const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+    const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
+
+    *(T *) (cdst + offs.dst[b] + dst_offset) = *(const T *) (cx + offs.src[b] + x_offset);
+}
+
+bool ggml_cuda_cpy_batched_supported(const ggml_tensor * src0, const ggml_tensor * src1) {
+    return src0->type == src1->type && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+           ggml_nelements(src0) == ggml_nelements(src1) && ggml_nelements(src0) > 0 &&
+           ggml_nelements(src0) < ((int64_t) 1 << 31);
+}
+
+void ggml_cuda_cpy_batched(ggml_backend_cuda_context & ctx, const ggml_tensor * const * srcs, const ggml_tensor * const * dsts, const int n) {
+    GGML_ASSERT(n > 0);
+    const ggml_tensor * src0 = srcs[0];
+    const ggml_tensor * src1 = dsts[0];
+    GGML_ASSERT(ggml_cuda_cpy_batched_supported(src0, src1));
+
+    const int64_t ne = ggml_nelements(src0);
+    const char * base_src = (const char *) src0->data;
+    char *       base_dst = (char *) src1->data;
+
+    const int num_blocks = (ne + CUDA_CPY_BLOCK_SIZE_BATCHED - 1) / CUDA_CPY_BLOCK_SIZE_BATCHED;
+    for (int c0 = 0; c0 < n; c0 += GGML_CUDA_CPY_BATCH_MAX) {
+        const int nc = std::min(n - c0, GGML_CUDA_CPY_BATCH_MAX);
+        ggml_cuda_cpy_batch_offs offs;
+        for (int b = 0; b < GGML_CUDA_CPY_BATCH_MAX; ++b) {
+            offs.src[b] = 0;
+            offs.dst[b] = 0;
+        }
+        for (int b = 0; b < nc; ++b) {
+            offs.src[b] = (const char *) srcs[c0 + b]->data - base_src;
+            offs.dst[b] = (const char *) dsts[c0 + b]->data - base_dst;
+        }
+        const dim3 grid(num_blocks, nc, 1);
+        if (src0->type == GGML_TYPE_F32) {
+            cpy_scalar_batched<float><<<grid, CUDA_CPY_BLOCK_SIZE_BATCHED, 0, ctx.stream()>>>(base_src, base_dst, offs, ne,
+                src0->ne[0], src0->ne[1], src0->ne[2], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->ne[0], src1->ne[1], src1->ne[2], src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
+        } else {
+            cpy_scalar_batched<half><<<grid, CUDA_CPY_BLOCK_SIZE_BATCHED, 0, ctx.stream()>>>(base_src, base_dst, offs, ne,
+                src0->ne[0], src0->ne[1], src0->ne[2], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->ne[0], src1->ne[1], src1->ne[2], src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
