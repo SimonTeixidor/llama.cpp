@@ -3,8 +3,13 @@
 
 // fused-kernel recurrent-state output; strides in elements (per-seq stride is always D, set in-kernel)
 struct ggml_cuda_gated_delta_net_fused_cache {
-    float * data;        // rollback slot 0
-    int64_t slot_stride; // between rollback slots (0 when K==1)
+    float * data        = nullptr; // rollback slot 0 (nullptr: snapshots go to the gdn output tail as unfused)
+    int64_t slot_stride = 0;       // between rollback slots (0 when K==1)
+    // read the initial state straight from the cache row s_idx[seq] instead of from the GET_ROWS copy
+    // (s_rows = cache base, s_row_stride in floats). nullptr: use the gdn's src[5] as usual.
+    const int32_t * s_idx        = nullptr;
+    const float *   s_rows       = nullptr;
+    int64_t         s_row_stride = 0;
 };
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

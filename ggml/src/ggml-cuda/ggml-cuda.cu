@@ -4768,6 +4768,92 @@ static int ggml_cuda_w4a16_match_resadd(const ggml_cgraph * cgraph, const int i,
     return -1;
 }
 
+static int ggml_cuda_find_node_back(const ggml_cgraph * cgraph, int from, const ggml_tensor * t) {
+    for (int j = from; j >= 0 && j >= from - 512; --j) {
+        if (cgraph->nodes[j] == t) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+// RDNA3.5: with rollback snapshots (K = n_rs_seq + 1 > 1) build_rs gathers the initial delta-net state with GET_ROWS
+// (one 3 MiB row copy per layer on qwen3.8-27b, 48 per verify), because the row to read (rollback group r) is only
+// known at set_input time. Skip the GET_ROWS and let the GDN kernel read row s_idx[seq] of the cache itself (the index
+// stays device data, so HIP graphs remain valid). In-place safe: every GDN kernel loads its state elements into
+// registers before the first snapshot store, by the same thread.
+// Returns the node index of the GET_ROWS whose output (through reshapes) is the gdn's state, or -1.
+static int ggml_cuda_gdn_state_direct(const ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int gdn_idx) {
+    if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        return -1;
+    }
+    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) <= 1) {
+        return -1;
+    }
+    const ggml_tensor * src_v = gdn->src[2];
+    const ggml_tensor * src_g = gdn->src[3];
+    if (src_g->ne[0] != 1) {   // not KDA
+        return -1;
+    }
+    const int64_t S_v = src_v->ne[0], H = src_v->ne[1], n_seqs = src_v->ne[3];
+    const ggml_tensor * t = gdn->src[5];
+    int prev_idx = gdn_idx;
+    for (int depth = 0; depth < 4 && t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW); ++depth) {
+        if (t->view_offs != 0 || !ggml_is_contiguous(t) || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return -1;
+        }
+        const int idx = ggml_cuda_find_node_back(cgraph, prev_idx - 1, t);
+        if (idx < 0 || ggml_node_get_use_count(cgraph, idx) != 1) {
+            return -1;
+        }
+        prev_idx = idx;
+        t = t->src[0];
+    }
+    if (t == nullptr || t->op != GGML_OP_GET_ROWS || t->type != GGML_TYPE_F32 || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    const ggml_tensor * rows = t->src[0];
+    const ggml_tensor * ids  = t->src[1];
+    if (rows->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || rows->nb[0] != sizeof(float) ||
+        rows->ne[0] != S_v * S_v * H || t->ne[0] != rows->ne[0] || t->ne[1] != n_seqs || t->ne[2] != 1 || t->ne[3] != 1 ||
+        ids->ne[0] != n_seqs || ids->nb[0] != sizeof(int32_t) || rows->nb[1] % (16 * sizeof(float)) != 0 ||
+        ((uintptr_t) rows->data % 16) != 0) {
+        return -1;
+    }
+    const int gr_idx = ggml_cuda_find_node_back(cgraph, prev_idx - 1, t);
+    if (gr_idx < 0 || ggml_node_get_use_count(cgraph, gr_idx) != 1 || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return -1;
+    }
+    return gr_idx;
+}
+
+static void ggml_cuda_gdn_state_direct_args(const ggml_tensor * gr, ggml_cuda_gated_delta_net_fused_cache & c) {
+    c.s_idx        = (const int32_t *) gr->src[1]->data;
+    c.s_rows       = (const float *) gr->src[0]->data;
+    c.s_row_stride = (int64_t) (gr->src[0]->nb[1] / sizeof(float));
+}
+
+static bool ggml_cuda_gdn_cache_fusion_uses_ok(const ggml_cgraph * cgraph, int i, int nodes_to_skip) {
+    bool uses_ok = true;
+    for (int j = i; uses_ok && j <= i + nodes_to_skip; ++j) {
+        if (j == i + nodes_to_skip) {
+            continue;
+        }
+        const ggml_tensor * candidate = cgraph->nodes[j];
+        int internal_uses = 0;
+        for (int k = i; k <= i + nodes_to_skip; ++k) {
+            for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                internal_uses += cgraph->nodes[k]->src[src] == candidate;
+            }
+        }
+        // The attention-score view is the one expected consumer after the snapshot copy.
+        const int allowed_external = j == i ? 1 : 0;
+        uses_ok = internal_uses + allowed_external == ggml_node_get_use_count(cgraph, j);
+    }
+    return uses_ok;
+}
+
 // RDNA3.5: a run of CPY nodes (only no-op view nodes in between) that share type, ne and nb and differ only in their
 // data pointers runs as one launch. Target: the K = n_rs_seq + 1 conv-state snapshot copies per delta-net layer that
 // build_conv_state emits (768 copies per qwen35 verify at n_rs_seq 15). The copies must be independent: no destination
@@ -4975,6 +5061,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 s_precomputed[r] = sk;
             }
             break;
+        }
+    }
+
+    if (node->op == GGML_OP_GET_ROWS) {
+        for (int j = i + 1; j < cgraph->n_nodes && j < i + 256; ++j) {
+            if (cgraph->nodes[j]->op == GGML_OP_GATED_DELTA_NET) {
+                if (ggml_cuda_gdn_state_direct(cuda_ctx, cgraph, j) == i) {
+                    return -1;   // elided: the gdn at j reads the cache row itself
+                }
+                break;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_GATED_DELTA_NET) {
+        const int gr_idx = ggml_cuda_gdn_state_direct(cuda_ctx, cgraph, i);
+        if (gr_idx >= 0) {
+            ggml_cuda_gated_delta_net_fused_cache fc;
+            ggml_cuda_gdn_state_direct_args(cgraph->nodes[gr_idx], fc);
+            ggml_cuda_gated_delta_net_fused_cache cache_fc;
+            const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, cache_fc);
+            if (nodes_to_skip > 0 && ggml_cuda_gdn_cache_fusion_uses_ok(cgraph, i, nodes_to_skip)) {
+                fc.data        = cache_fc.data;
+                fc.slot_stride = cache_fc.slot_stride;
+                ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fc);
+                return nodes_to_skip;
+            }
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fc);   // data == nullptr: unfused snapshot tail
+            return -1;
         }
     }
 
@@ -5386,22 +5501,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
-            bool uses_ok = true;
-            for (int j = i; uses_ok && j <= i + nodes_to_skip; ++j) {
-                if (j == i + nodes_to_skip) {
-                    continue;
-                }
-                const ggml_tensor * candidate = cgraph->nodes[j];
-                int internal_uses = 0;
-                for (int k = i; k <= i + nodes_to_skip; ++k) {
-                    for (int src = 0; src < GGML_MAX_SRC; ++src) {
-                        internal_uses += cgraph->nodes[k]->src[src] == candidate;
-                    }
-                }
-                // The attention-score view is the one expected consumer after the snapshot copy.
-                const int allowed_external = j == i ? 1 : 0;
-                uses_ok = internal_uses + allowed_external == ggml_node_get_use_count(cgraph, j);
-            }
+            const bool uses_ok = ggml_cuda_gdn_cache_fusion_uses_ok(cgraph, i, nodes_to_skip);
             if (!uses_ok) {
                 return 0;
             }
@@ -6865,6 +6965,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_cuda_w4a16_x16_note_write(*cuda_ctx, node);
                 }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (nodes_to_skip < 0) {
+                    // handled on its own (elided, or run through a non-default path): nothing else to skip
+                    if (op_prof) {
+                        g_ggml_cuda_op_prof.end(cuda_ctx->stream(), node, 0);
+                    }
+                    continue;
+                }
                 if (nodes_to_skip != 0 && cuda_ctx->w4a16_x16.key != nullptr) {
                     // the fused block's output (a norm's own cache key is exempt)
                     ggml_cuda_w4a16_x16_note_write(*cuda_ctx, cgraph->nodes[i + nodes_to_skip]);
