@@ -450,6 +450,122 @@ static __global__ void __launch_bounds__(TOPK_WG_THREADS) top_k_wg_kernel(
 
 #endif // defined(GGML_USE_HIP)
 
+// RDNA3.5 (results/2026-10-03-overnight/d): two-pass register top-k for small k (<= 32).
+// The MTP draft step's backend top-k 10 runs over the scattered full-vocab row (248320 floats); on HIP the default path
+// is a hipCUB device radix sort of the whole row plus a copy (~0.22 ms per call, verify-profile item 16). Here pass 1
+// splits each row over up to 128 blocks, every thread keeps a sorted register list of its best k keys, and the block
+// merges them with k rounds of a block-wide max; pass 2 merges the per-block lists of each row the same way. Keys are
+// (order-preserving float bits << 32) | ~col, so ties go to the lower column, as in the stable descending radix sort;
+// the output is sorted descending like the argsort fallback it replaces.
+static __device__ __forceinline__ uint64_t top_k_fast_key(const float v, const int col) {
+    const uint32_t bits = __float_as_uint(v);
+    const uint32_t ord  = bits ^ ((uint32_t) (-(int32_t) (bits >> 31)) | 0x80000000U);
+    return ((uint64_t) ord << 32) | (uint64_t) (0xFFFFFFFFu - (uint32_t) col);
+}
+
+template <int KP>
+static __device__ __forceinline__ void top_k_fast_insert(uint64_t (&v)[KP], const uint64_t key) {
+    if (key <= v[KP - 1]) {
+        return;
+    }
+    v[KP - 1] = key;
+#pragma unroll
+    for (int j = KP - 1; j > 0; --j) {
+        if (v[j] > v[j - 1]) {
+            const uint64_t t = v[j]; v[j] = v[j - 1]; v[j - 1] = t;
+        }
+    }
+}
+
+static __device__ __forceinline__ uint64_t top_k_fast_warp_max(uint64_t x) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const uint32_t lo = __shfl_xor_sync(0xffffffff, (uint32_t) x,         offset, 32);
+        const uint32_t hi = __shfl_xor_sync(0xffffffff, (uint32_t) (x >> 32), offset, 32);
+        const uint64_t y  = ((uint64_t) hi << 32) | lo;
+        x = y > x ? y : x;
+    }
+    return x;
+}
+
+// block-wide k-way selection over the threads' sorted lists; thread 0 sees each winner in order
+template <int KP, int NT, typename F>
+static __device__ __forceinline__ void top_k_fast_block_select(uint64_t (&v)[KP], const int k, F && emit) {
+    __shared__ uint64_t s_max[NT / 32];
+    const int tid = threadIdx.x;
+    for (int r = 0; r < k; ++r) {
+        const uint64_t m = top_k_fast_warp_max(v[0]);
+        if ((tid & 31) == 0) {
+            s_max[tid / 32] = m;
+        }
+        __syncthreads();
+        uint64_t best = s_max[0];
+#pragma unroll
+        for (int w = 1; w < NT / 32; ++w) {
+            best = s_max[w] > best ? s_max[w] : best;
+        }
+        __syncthreads();
+        if (v[0] == best && best != 0) {   // keys are unique (they carry the column), so exactly one thread pops
+#pragma unroll
+            for (int j = 0; j < KP - 1; ++j) {
+                v[j] = v[j + 1];
+            }
+            v[KP - 1] = 0;
+        }
+        if (tid == 0) {
+            emit(r, best);
+        }
+    }
+}
+
+template <int KP, int NT>
+static __global__ void top_k_fast_pass1(const float * __restrict__ src, uint64_t * __restrict__ part,
+                                        const int ncols, const int k, const int chunk) {
+    const int row = blockIdx.y;
+    const int blk = blockIdx.x;
+    const float * x = src + (size_t) row * ncols;
+    uint64_t v[KP];
+#pragma unroll
+    for (int j = 0; j < KP; ++j) {
+        v[j] = 0;
+    }
+    const int c0 = blk * chunk;
+    const int c1 = min(ncols, c0 + chunk);
+    for (int c = c0 + threadIdx.x; c < c1; c += NT) {
+        top_k_fast_insert<KP>(v, top_k_fast_key(x[c], c));
+    }
+    uint64_t * out = part + ((size_t) row * gridDim.x + blk) * k;
+    top_k_fast_block_select<KP, NT>(v, k, [&](int r, uint64_t key) { out[r] = key; });
+}
+
+template <int KP, int NT>
+static __global__ void top_k_fast_pass2(const uint64_t * __restrict__ part, int * __restrict__ dst,
+                                        const int nparts, const int k) {
+    const int row = blockIdx.x;
+    const uint64_t * p = part + (size_t) row * nparts * k;
+    uint64_t v[KP];
+#pragma unroll
+    for (int j = 0; j < KP; ++j) {
+        v[j] = 0;
+    }
+    for (int i = threadIdx.x; i < nparts * k; i += NT) {
+        top_k_fast_insert<KP>(v, p[i]);
+    }
+    int * out = dst + (size_t) row * k;
+    top_k_fast_block_select<KP, NT>(v, k, [&](int r, uint64_t key) { out[r] = (int) (0xFFFFFFFFu - (uint32_t) key); });
+}
+
+template <int KP>
+static void top_k_fast_launch(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int nrows, int k,
+                              cudaStream_t stream) {
+    constexpr int NT = 256;
+    const int nparts = std::max(1, std::min(128, (ncols + 16*NT - 1) / (16*NT)));
+    const int chunk  = (ncols + nparts - 1) / nparts;
+    ggml_cuda_pool_alloc<uint64_t> part(pool, (size_t) nrows * nparts * k);
+    top_k_fast_pass1<KP, NT><<<dim3(nparts, nrows), NT, 0, stream>>>(src, part.get(), ncols, k, chunk);
+    top_k_fast_pass2<KP, NT><<<nrows, NT, 0, stream>>>(part.get(), dst, nparts, k);
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -482,6 +598,19 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
 #endif
+    // two-pass register top-k: k <= 32 only, and rows whose finite keys fit the per-thread lists (>= k columns, < 2^31);
+    // the multi-row radix cases above keep their path
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc) &&
+            k >= 1 && k <= 32 && ncols >= k && ncols > 64 && ncols < INT32_MAX && nrows <= 65535) {
+        if (k <= 8) {
+            top_k_fast_launch<8>(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+        } else if (k <= 16) {
+            top_k_fast_launch<16>(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+        } else {
+            top_k_fast_launch<32>(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+        }
+        return;
+    }
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
