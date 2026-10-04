@@ -1308,7 +1308,10 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // the bucket is 1024 cells (upstream: 256): every n_kv change alters the KV-view / mask / FA node properties, which
+    // invalidates the captured CUDA/HIP graph of every graph that reads the KV (each speculative verify width has its
+    // own), so a coarser bucket re-warms them 4x less often, at the cost of attention over up to 1023 masked cells
+    const uint32_t n_pad_cur = std::max(n_pad, 1024u);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
