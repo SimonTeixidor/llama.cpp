@@ -2775,13 +2775,70 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         graph->node_props.resize(cgraph->n_nodes);
     }
 
+    // GGML_CUDA_GRAPH_DIAG=1: on a post-warmup property change, log the first node that differs. =2: also count how many
+    // nodes changed, how many of them are kernel nodes (not view/no-op) and how many changed a data pointer (own or src).
+    static const int diag = getenv("GGML_CUDA_GRAPH_DIAG") != nullptr ? std::max(1, atoi(getenv("GGML_CUDA_GRAPH_DIAG"))) : 0;
+    // post-warmup: find out whether only FA nodes changed (HIP: ggml_cuda_graph_fa_update)
+    const bool count_changes = !res && graph->warmup_complete;
+    int n_changed = 0, n_changed_kernel = 0, n_changed_data = 0, n_changed_fa = 0, first_data = -1, first_kernel_nonfa = -1;
+    graph->fa_only_change = false;
+    graph->fa_changed.clear();
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_cuda_graph::node_properties prop = ggml_cuda_graph_node_props(cgraph->nodes[i]);
+        const bool differs = (count_changes || !res) && memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        if (count_changes && differs) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            const ggml_cuda_graph::node_properties & o = graph->node_props[i];
+            n_changed++;
+            if (!ggml_cuda_is_view_or_noop(n)) {
+                n_changed_kernel++;
+                if (n->op == GGML_OP_FLASH_ATTN_EXT) {
+                    n_changed_fa++;
+                    graph->fa_changed.push_back(i);
+                } else if (first_kernel_nonfa < 0) {
+                    first_kernel_nonfa = i;
+                }
+            }
+            bool data_changed = o.node.data != n->data;
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                data_changed |= o.node_src_data_ptrs[j] != prop.node_src_data_ptrs[j];
+            }
+            if (data_changed) {
+                n_changed_data++;
+                if (first_data < 0) {
+                    first_data = i;
+                }
+            }
+        }
+
+        if (res || differs) {
+            if (diag && !res && graph->warmup_complete) {
+                const ggml_tensor & o = graph->node_props[i].node;
+                const ggml_tensor * n = cgraph->nodes[i];
+                GGML_LOG_WARN("graph-diag: key %p n_nodes %d first change node %d '%s' %s ne %lld,%lld,%lld,%lld (was %lld,%lld,%lld,%lld) src0 '%s' ne1 %lld (was %lld) src1 ne1 %lld (was %lld) data %s\n",
+                    graph_key, cgraph->n_nodes, i, n->name, ggml_op_desc(n),
+                    (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                    (long long) o.ne[0], (long long) o.ne[1], (long long) o.ne[2], (long long) o.ne[3],
+                    n->src[0] ? n->src[0]->name : "-",
+                    (long long) (n->src[0] ? n->src[0]->ne[1] : 0), (long long) graph->node_props[i].node_src_ne[0][1],
+                    (long long) (n->src[1] ? n->src[1]->ne[1] : 0), (long long) graph->node_props[i].node_src_ne[1][1],
+                    o.data != n->data ? "changed" : "same");
+            }
             graph->node_props[i] = prop;
             res = true;
         }
+    }
+
+    graph->fa_only_change = count_changes && n_changed > 0 && n_changed_data == 0 && first_kernel_nonfa < 0 && n_changed_fa > 0;
+
+    if (diag >= 2 && count_changes && n_changed > 0) {
+        GGML_LOG_WARN("graph-diag2: key %p n_nodes %d changed %d kernel %d fa %d data %d first_data %d '%s' first_kernel_nonfa %d '%s' %s\n",
+            graph_key, cgraph->n_nodes, n_changed, n_changed_kernel, n_changed_fa, n_changed_data,
+            first_data, first_data >= 0 ? cgraph->nodes[first_data]->name : "-",
+            first_kernel_nonfa, first_kernel_nonfa >= 0 ? cgraph->nodes[first_kernel_nonfa]->name : "-",
+            first_kernel_nonfa >= 0 ? ggml_op_desc(cgraph->nodes[first_kernel_nonfa]) : "-");
     }
 
     return res;
@@ -6814,6 +6871,175 @@ struct ggml_cuda_op_prof {
 };
 static ggml_cuda_op_prof g_ggml_cuda_op_prof;
 
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+// When n_kv crosses a bucket boundary, the only kernel nodes of a warm verify graph whose properties change are its
+// FLASH_ATTN_EXT nodes (K/V/mask views change ne, every data pointer stays). Instead of the warmup reset (one direct
+// call + one full re-capture of ~2.4k kernels), re-capture only the FA nodes into small graphs, check that the kernels
+// match one for one, and copy their kernel parameters onto the matching nodes of the warm graph (then
+// hipGraphExecUpdate). Measured on gfx1151 (qwen3.8-27b MTP verify, 2026-10-04): ~2 ms of host time per update.
+
+// the current capture's dependency frontier (the last node(s) added to the stream's capture graph)
+static std::vector<hipGraphNode_t> ggml_cuda_capture_frontier(hipStream_t stream) {
+    hipStreamCaptureStatus status;
+    unsigned long long id = 0;
+    hipGraph_t g = nullptr;
+    const hipGraphNode_t * deps = nullptr;
+    size_t n = 0;
+    std::vector<hipGraphNode_t> out;
+    if (hipStreamGetCaptureInfo_v2(stream, &status, &id, &g, &deps, &n) != hipSuccess || status != hipStreamCaptureStatusActive) {
+        (void) hipGetLastError();
+        return out;
+    }
+    out.assign(deps, deps + n);
+    return out;
+}
+
+// the chain of nodes added after `before` and ending at `after` (single dependency each), in launch order
+static bool ggml_cuda_capture_chain(const std::vector<hipGraphNode_t> & before, const std::vector<hipGraphNode_t> & after,
+                                    std::vector<hipGraphNode_t> & chain) {
+    chain.clear();
+    if (after.size() != 1) {
+        return false;
+    }
+    hipGraphNode_t cur = after[0];
+    for (int guard = 0; guard < 16; ++guard) {
+        if (std::find(before.begin(), before.end(), cur) != before.end()) {
+            std::reverse(chain.begin(), chain.end());
+            return !chain.empty();
+        }
+        hipGraphNodeType t;
+        if (hipGraphNodeGetType(cur, &t) != hipSuccess || t != hipGraphNodeTypeKernel) {
+            return false;
+        }
+        chain.push_back(cur);
+        size_t nd = 0;
+        if (hipGraphNodeGetDependencies(cur, nullptr, &nd) != hipSuccess) {
+            return false;
+        }
+        if (nd == 0) {
+            std::reverse(chain.begin(), chain.end());
+            return before.empty();
+        }
+        if (nd != 1) {
+            return false;
+        }
+        hipGraphNode_t dep;
+        nd = 1;
+        if (hipGraphNodeGetDependencies(cur, &dep, &nd) != hipSuccess) {
+            return false;
+        }
+        cur = dep;
+    }
+    return false;
+}
+
+// kernel nodes of a small captured graph, in chain order
+static bool ggml_cuda_graph_chain_nodes(hipGraph_t g, std::vector<hipGraphNode_t> & out) {
+    out.clear();
+    size_t nr = 0;
+    if (hipGraphGetRootNodes(g, nullptr, &nr) != hipSuccess || nr != 1) {
+        return false;
+    }
+    hipGraphNode_t cur;
+    nr = 1;
+    if (hipGraphGetRootNodes(g, &cur, &nr) != hipSuccess) {
+        return false;
+    }
+    for (int guard = 0; guard < 16; ++guard) {
+        hipGraphNodeType t;
+        if (hipGraphNodeGetType(cur, &t) != hipSuccess || t != hipGraphNodeTypeKernel) {
+            return false;
+        }
+        out.push_back(cur);
+        size_t nd = 0;
+        if (hipGraphNodeGetDependentNodes(cur, nullptr, &nd) != hipSuccess) {
+            return false;
+        }
+        if (nd == 0) {
+            return true;
+        }
+        if (nd != 1) {
+            return false;
+        }
+        nd = 1;
+        if (hipGraphNodeGetDependentNodes(cur, &cur, &nd) != hipSuccess) {
+            return false;
+        }
+    }
+    return false;
+}
+
+// returns true if every changed FA node was updated in place; false = caller must re-capture the whole graph
+static bool ggml_cuda_graph_fa_update(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, ggml_cuda_graph * graph) {
+    if (!graph->fa_map_valid || graph->instance == nullptr || graph->graph == nullptr || graph->fa_changed.empty()) {
+        return false;
+    }
+    hipStream_t stream = cuda_ctx->stream();
+    struct upd { hipGraphNode_t orig; hipKernelNodeParams p; };
+    std::vector<upd> upds;
+    std::vector<hipGraph_t> tmps;
+    bool ok = true;
+    for (int idx : graph->fa_changed) {
+        auto it = graph->fa_graph_nodes.find(idx);
+        if (it == graph->fa_graph_nodes.end()) {
+            ok = false;
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+        }
+        CUDA_CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeRelaxed));
+        const bool fwd = ggml_cuda_compute_forward(*cuda_ctx, cgraph->nodes[idx]);
+        hipGraph_t tmp = nullptr;
+        CUDA_CHECK(hipStreamEndCapture(stream, &tmp));
+        {
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+        tmps.push_back(tmp);
+        std::vector<hipGraphNode_t> nn;
+        if (!fwd || !ggml_cuda_graph_chain_nodes(tmp, nn) || nn.size() != it->second.size()) {
+            ok = false;
+            break;
+        }
+        for (size_t k = 0; k < nn.size(); ++k) {
+            hipKernelNodeParams pn, po;
+            if (hipGraphKernelNodeGetParams(nn[k], &pn) != hipSuccess || hipGraphKernelNodeGetParams(it->second[k], &po) != hipSuccess ||
+                pn.func != po.func) {
+                ok = false;
+                break;
+            }
+            upds.push_back({ it->second[k], pn });
+        }
+        if (!ok) {
+            break;
+        }
+    }
+    if (ok) {
+        for (auto & u : upds) {
+            if (hipGraphKernelNodeSetParams(u.orig, &u.p) != hipSuccess) {
+                (void) hipGetLastError();
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            ggml_cuda_graph_update_executable(cuda_ctx, ggml_cuda_graph_get_key(cgraph));
+        }
+    }
+    for (hipGraph_t t : tmps) {
+        CUDA_CHECK(hipGraphDestroy(t));
+    }
+    if (!ok) {
+        graph->fa_map_valid = false; // a partially updated graph must be fully re-captured
+    }
+    return ok;
+}
+#endif // USE_CUDA_GRAPH && GGML_USE_HIP
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -6849,6 +7075,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+            const bool fa_record = use_cuda_graph && cuda_graph_update_required;
+            ggml_cuda_graph * fa_rec_graph = fa_record ? cuda_ctx->cuda_graph(graph_key) : nullptr;
+            if (fa_record) {
+                fa_rec_graph->fa_graph_nodes.clear();
+                fa_rec_graph->fa_map_valid = true;
+            }
+#endif
 
             // W4A16 FP16 activation cache is per graph evaluation (tensor contents change between evaluations)
             ggml_cuda_w4a16_x16_reset(*cuda_ctx);
@@ -7010,7 +7244,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+                const bool fa_rec = fa_record && node->op == GGML_OP_FLASH_ATTN_EXT && !is_concurrent_event_active;
+                std::vector<hipGraphNode_t> fa_before;
+                if (fa_rec) {
+                    fa_before = ggml_cuda_capture_frontier(cuda_ctx->stream());
+                }
+#endif
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+                if (fa_rec) {
+                    std::vector<hipGraphNode_t> chain;
+                    if (ggml_cuda_capture_chain(fa_before, ggml_cuda_capture_frontier(cuda_ctx->stream()), chain)) {
+                        fa_rec_graph->fa_graph_nodes[i] = chain;
+                    } else {
+                        fa_rec_graph->fa_map_valid = false;
+                    }
+                }
+#endif
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -7131,7 +7382,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -7144,6 +7395,28 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
+#ifdef GGML_USE_HIP
+                // only FA nodes changed (an n_kv step): update them in the warm graph and replay it; if that fails,
+                // re-capture the whole graph in place on this call
+                if (properties_changed && graph->fa_only_change) {
+                    static const bool diag_fa = getenv("GGML_CUDA_GRAPH_DIAG") != nullptr;
+                    const int64_t t0 = diag_fa ? ggml_time_us() : 0;
+                    const bool fa_ok = ggml_cuda_graph_fa_update(cuda_ctx, cgraph, graph);
+                    if (diag_fa) {
+                        GGML_LOG_WARN("graph-fa-update: key %p n_nodes %d fa %d ok %d %.2f ms\n", graph_key, cgraph->n_nodes,
+                            (int) graph->fa_changed.size(), (int) fa_ok, (ggml_time_us() - t0)/1000.0);
+                    }
+                    if (fa_ok) {
+                        properties_changed = false;
+                    } else {
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                    }
+                }
+                if (use_cuda_graph && cuda_graph_update_required) {
+                    // full in-place re-capture, chosen above
+                } else
+#endif
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;

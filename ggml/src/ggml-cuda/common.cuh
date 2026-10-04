@@ -1319,6 +1319,13 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    // HIP: the captured kernel nodes of every FLASH_ATTN_EXT node (ggml node index -> its chain of graph kernel nodes, in
+    // launch order), and the FA nodes whose properties changed in the last property check when nothing else but views
+    // and FA nodes changed and no data pointer moved (see ggml_cuda_graph_fa_update).
+    std::unordered_map<int, std::vector<cudaGraphNode_t>> fa_graph_nodes;
+    bool fa_map_valid = false;
+    bool fa_only_change = false;
+    std::vector<int> fa_changed;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
