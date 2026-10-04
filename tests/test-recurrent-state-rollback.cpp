@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <clocale>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -102,7 +103,7 @@ static llama_context_ptr init_ctx(llama_model * model, llama_context_params cpar
 static llama_context_ptr make_ctx(const common_params & params, llama_model * model, uint8_t fill) {
     auto cparams = common_context_params_to_llama(params);
     cparams.n_seq_max = 1;
-    cparams.n_rs_seq  = 8;
+    cparams.n_rs_seq  = getenv("TRSR_N_RS_SEQ") ? (uint32_t) atoi(getenv("TRSR_N_RS_SEQ")) : 8;
     cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) (cparams.n_rs_seq + 1));
     cparams.n_ubatch  = std::max(cparams.n_ubatch, (uint32_t) (cparams.n_rs_seq + 1));
     return init_ctx(model, cparams, fill);
@@ -780,6 +781,8 @@ static test_results run_tests(const common_params & params, llama_model * model)
     return res;
 }
 
+static int test_spec_rounds(const common_params & params, llama_model * model);
+
 // Run the tests for a single model file.
 // Returns the per-test statuses.
 static test_results run_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
@@ -800,6 +803,11 @@ static test_results run_tests_for_model(const std::string & model_path, const st
         return {};
     }
 
+    if (getenv("TRSR_SPEC_ROUNDS") != nullptr) {
+        const test_status st = test_spec_rounds(params, model) == 0 ? test_status::PASS : test_status::FAIL;
+        return { st, st };
+    }
+
     return run_tests(params, model);
 }
 
@@ -808,6 +816,60 @@ static void print_usage(int /* argc */, char ** argv) {
     LOG("\n  %s -m your_model.gguf\n", argv[0]);
     LOG("\n  %s --models tests/test-models\n", argv[0]);
     LOG("\n");
+}
+
+// TRSR_SPEC_ROUNDS=1: emulate speculative verify rounds on one context -- a batch of w = 1..16 tokens (all logits),
+// then roll back r = 0..min(w - 1, n_rs_seq) of them, repeated -- and print an FNV-1a hash of every logit produced.
+// The caller compares the hash across builds or settings that must be bitwise identical (TRSR_N_RS_SEQ sets n_rs_seq).
+static int test_spec_rounds(const common_params & params, llama_model * model) {
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int           n_vocab = llama_vocab_n_tokens(vocab);
+    llama_context_ptr ctx_ptr = make_ctx(params, model, 0);
+    llama_context * ctx = ctx_ptr.get();
+    if (ctx == nullptr) {
+        fprintf(stderr, "%s : failed to init ctx\n", __func__);
+        return 1;
+    }
+    const uint32_t n_rs_seq = llama_n_rs_seq(ctx);
+    const auto tok = [&](llama_pos pos) { return (llama_token) ((7*(uint32_t) pos + 13) % (uint32_t) n_vocab); };
+
+    uint64_t h = 1469598103934665603ULL;
+    const auto mix = [&](const float * v, int n) {
+        const unsigned char * b = (const unsigned char *) v;
+        for (size_t k = 0; k < (size_t) n * sizeof(float); ++k) { h ^= b[k]; h *= 1099511628211ULL; }
+    };
+
+    const llama_pos n_prompt = 40;
+    std::vector<llama_token> prompt(n_prompt);
+    for (llama_pos p = 0; p < n_prompt; ++p) prompt[p] = tok(p);
+    if (!decode_tokens(ctx, prompt, n_prompt)) { fprintf(stderr, "%s : prompt decode failed\n", __func__); return 1; }
+    mix(llama_get_logits_ith(ctx, -1), n_vocab);
+
+    const int n_rounds = getenv("TRSR_ROUNDS") ? atoi(getenv("TRSR_ROUNDS")) : 64;
+    const int w_max    = (int) std::min<uint32_t>(16, n_rs_seq + 1);
+    llama_pos pos = n_prompt;
+    int n_rb = 0;
+    for (int i = 0; i < n_rounds; ++i) {
+        const int w = 1 + (i * 7 + i / 16) % w_max;                // every width, in a mixed order
+        const int r = std::min<int>((i * 5 + 3) % w, (int) n_rs_seq); // every rollback 0..w-1
+        llama_batch batch = llama_batch_init(w, 0, 1);
+        for (int k = 0; k < w; ++k) common_batch_add(batch, tok(pos + k), pos + k, { 0 }, true);
+        const bool ok = llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+        if (!ok) { fprintf(stderr, "%s : decode failed at round %d\n", __func__, i); return 1; }
+        for (int k = 0; k < w; ++k) mix(llama_get_logits_ith(ctx, k), n_vocab);
+        pos += w;
+        if (r > 0) {
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, pos - r, -1)) {
+                fprintf(stderr, "%s : rollback of %d failed at round %d\n", __func__, r, i); return 1;
+            }
+            pos -= r;
+            n_rb++;
+        }
+        if ((i + 1) % 16 == 0) fprintf(stderr, "%s : n_rs_seq %u round %d w %d r %d hash %016llx\n", __func__, n_rs_seq, i, w, r, (unsigned long long) h);
+    }
+    printf("SPEC_ROUNDS n_rs_seq=%u rounds=%d rollbacks=%d final_pos=%d hash=%016llx\n", n_rs_seq, n_rounds, n_rb, (int) pos, (unsigned long long) h);
+    return 0;
 }
 
 int main(int argc, char ** argv) {
