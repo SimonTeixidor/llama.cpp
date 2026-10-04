@@ -718,6 +718,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
+    // RDNA3.5, D=256 with f16/f32 K/V and the GQA optimization, Q->ne[1] <= 16 (speculative verify): WMMA from 5 query rows,
+    // tile kernel for 1-4. The generic rule below takes WMMA for Q->ne[1]*gqa_ratio_eff > 16 (from 9 rows at GQA 6, from 3 at
+    // GQA 8), and at 5-8 rows the scalar tile kernel is compute-bound. Measured on gfx1151 (qwen3.8-27b, GQA 6, 24k KV, 2026-10-03):
+    // 668-682 us per call at 5-8 rows with the 16-column WMMA config against 1138-1148 us for the tile kernel.
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && amd_wmma_available(cc) && gqa_opt_applies &&
+            Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] <= 16 &&
+            !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+        return Q->ne[1] >= 5 ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_TILE;
+    }
+
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
     // Only head sizes that have WMMA device code in flash_attn_ext_f16 (fattn-mma-f16.cuh, AMD_WMMA_AVAILABLE guard:
     // DKQ <= 128 or DKQ == 256) may be routed here; any other head size (e.g. 192) hits NO_DEVICE_CODE -> __trap().
