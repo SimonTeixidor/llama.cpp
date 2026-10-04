@@ -6497,6 +6497,14 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+void ggml_gated_delta_net_set_state_ids(
+        struct ggml_tensor * gdn,
+        struct ggml_tensor * ids) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    gdn->src[8] = ids;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(

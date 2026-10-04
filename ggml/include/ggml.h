@@ -2692,6 +2692,12 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // optional: the I32 row ids the state was gathered with (get_rows(cache, ids) -> state). A backend may then read the
+    // state row straight from the cache; making the ids a src keeps them allocated until this node has run.
+    GGML_API void ggml_gated_delta_net_set_state_ids(
+            struct ggml_tensor * gdn,
+            struct ggml_tensor * ids);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

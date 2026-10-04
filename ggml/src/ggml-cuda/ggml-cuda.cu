@@ -4878,6 +4878,11 @@ static int ggml_cuda_gdn_state_direct(const ggml_backend_cuda_context * cuda_ctx
         ((uintptr_t) rows->data % 16) != 0) {
         return -1;
     }
+    // the ids must also be a src of the gdn (ggml_gated_delta_net_set_state_ids): the kernel reads them when the gdn runs,
+    // and gallocr would otherwise free their copy after the elided GET_ROWS, the ids' last consumer it knows of
+    if (gdn->src[8] != ids) {
+        return -1;
+    }
     const int gr_idx = ggml_cuda_find_node_back(cgraph, prev_idx - 1, t);
     if (gr_idx < 0 || ggml_node_get_use_count(cgraph, gr_idx) != 1 || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return -1;

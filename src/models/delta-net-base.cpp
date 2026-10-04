@@ -565,6 +565,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    // the rows build_rs gathered s with: lets a backend read the state from the cache row directly (ggml-cuda
+    // GDN_STATE_DIRECT) with the ids kept alive by this node instead of only by the GET_ROWS
+    ggml_gated_delta_net_set_state_ids(gdn_out, inp->s_copy_main);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

@@ -5926,6 +5926,7 @@ struct test_gdn_state_gather : public test_case {
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
         ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, st, K);
+        ggml_gated_delta_net_set_state_ids(out, idx);   // as build_recurrent_attn: enables the direct state read
         attn_node = ggml_view_4d(ctx, out, S, H, n_tokens, n_seqs, ggml_row_size(out->type, S),
                                  ggml_row_size(out->type, S * H), ggml_row_size(out->type, S * H * n_tokens), 0);
         attn_node = ggml_scale(ctx, attn_node, 1.0f);   // a real consumer, as the gated norm in the model
