@@ -688,6 +688,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
+    // RDNA3.5, q8_0 K/V, one query row (the MTP draft step over a q8_0 draft KV cache): the vector kernel, not the q8_0 tile
+    // kernel. Measured on gfx1151 (D=256 GQA 6, 24k KV, 2026-10-03): 513-588 us per call against 769-819 us.
+    if (ggml_cuda_fattn_tile_q8_0_KV_supported(dst) && can_use_vector_kernel &&
+            ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) != nullptr) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     if (ggml_cuda_fattn_tile_q8_0_KV_supported(dst) && gqa_opt_applies && gqa_ratio_eff >= 2) {
         return BEST_FATTN_KERNEL_TILE;
     }
