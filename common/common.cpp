@@ -1748,6 +1748,44 @@ void common_threadpools::init(llama_context * ctx, const common_params & params)
 }
 
 //
+// MTPX host trace (results/2026-09-12-mtp-opt/)
+//
+
+static FILE * common_mtpx_file() {
+    static FILE * f = []() -> FILE * {
+        const char * p = getenv("LLAMA_MTPX_TRACE");
+        if (p == nullptr || *p == '\0' || strcmp(p, "0") == 0) {
+            return nullptr;
+        }
+        if (strcmp(p, "1") == 0 || strcmp(p, "stderr") == 0) {
+            return stderr;
+        }
+        FILE * fp = fopen(p, "w");
+        if (fp != nullptr) {
+            setvbuf(fp, nullptr, _IOFBF, 1 << 20);
+        }
+        return fp;
+    }();
+    return f;
+}
+
+bool common_mtpx_trace_on() {
+    return common_mtpx_file() != nullptr;
+}
+
+void common_mtpx_mark(const char * tag, int a, int b) {
+    FILE * f = common_mtpx_file();
+    if (f == nullptr) {
+        return;
+    }
+    static int n = 0;
+    fprintf(f, "MTPX %lld %s %d %d\n", (long long) ggml_time_us(), tag, a, b);
+    if (++n % 4096 == 0 || strcmp(tag, "END") == 0) {
+        fflush(f);
+    }
+}
+
+//
 // Batch utils
 //
 

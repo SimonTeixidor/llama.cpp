@@ -2120,7 +2120,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                common_mtpx_mark("c0", batch.size());
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                common_mtpx_mark("c1", rc);
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
@@ -2223,7 +2225,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int64_t t_step0 = cost.on ? ggml_time_us() : 0;
+            common_mtpx_mark("d0", i, batch.size());
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            common_mtpx_mark("d1", ret);
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -2246,6 +2250,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const int32_t n_draft_eff = cost.on ? 0 : adaptive_n_draft(seq_id, params.n_max, params.n_min);
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                common_mtpx_mark("d2", i);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
