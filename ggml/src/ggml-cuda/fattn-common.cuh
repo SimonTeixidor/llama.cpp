@@ -724,6 +724,13 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+// RDNA3.5, D = 256, q8_0 K/V at 3..16 query rows (the MTP catch-up over a q8_0 draft KV): the WMMA kernel reads the
+// q8_0 K/V natively (per-chunk dequantization in its tile loader) instead of converting the whole KV to f16 on every
+// call and running the tile kernel (3..8 rows) or WMMA on the copy (9..16 rows).
+static bool ggml_cuda_fattn_q8_wmma_rows(const int64_t ne1) {
+    return ne1 >= 3 && ne1 <= 16;
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(

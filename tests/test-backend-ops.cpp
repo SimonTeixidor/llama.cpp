@@ -14498,16 +14498,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {64, 1, 1, 1}, 32)); // ncols <= 64: not the fast path
     }
 
-    // qwen3.8-27b verify attention (D=256, 4 KV heads, GQA 6) at n_q = 1..16 over 2k / 24k / 32k KV with and
-    // without n_kv padding, plus the MTP draft's q8_0 single row, plus random masks. Only with TBO_FA_VERIFY_CASES=1.
+    // qwen3.8-27b verify attention (D=256, 4 KV heads, GQA 6) at n_q = 1..16 over 2k / 4k / 24k / 32k KV with and
+    // without n_kv padding, plus the MTP draft's q8_0 KV (the single draft row and the 3..16-row catch-up, which reads
+    // the q8_0 K/V natively in the WMMA kernel on RDNA3.5), plus random masks. Only with TBO_FA_VERIFY_CASES=1.
     if (getenv("TBO_FA_VERIFY_CASES") != nullptr) {
         const std::vector<std::pair<int64_t, int64_t>> kvs = {
-            {2048, 2048}, {2048, 1500}, {24576, 24576}, {24576, 23900}, {24576, 23553}, {32768, 32500}};
+            {2048, 2048}, {2048, 1500}, {4096, 3000}, {24576, 24576}, {24576, 23900}, {24576, 23553}, {32768, 32500}};
         for (auto kv : kvs) {
             for (int64_t nb = 1; nb <= 16; ++nb) {
                 test_cases.emplace_back(new test_flash_attn_ext_verify(256, 4, 6, kv.first, nb, kv.second, GGML_TYPE_F16));
             }
-            for (int64_t nb : {1, 2, 3, 4, 5, 8, 9, 12, 16}) {
+            for (int64_t nb : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16}) {
                 test_cases.emplace_back(new test_flash_attn_ext_verify(256, 4, 6, kv.first, nb, kv.second, GGML_TYPE_Q8_0));
             }
         }
@@ -14865,14 +14866,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         return test_cases;
     }
 
-    // verify attention perf at 24k (KV 100 MB/layer >> 32 MB LLC), n_q = 1..16, plus the q8_0 MTP row.
+    // verify attention perf at 24k (KV 100 MB/layer >> 32 MB LLC), n_q = 1..16, plus the q8_0 MTP rows.
     // TBO_FA_VERIFY_PERF=1 replaces the whole perf list.
     if (getenv("TBO_FA_VERIFY_PERF") != nullptr) {
         for (auto kv : std::vector<std::pair<int64_t, int64_t>>{{24576, 24576}, {25600, 24576}, {28672, 24576}}) {
             for (int64_t nb = 1; nb <= 16; ++nb) {
                 test_cases.emplace_back(new test_flash_attn_ext_verify(256, 4, 6, kv.first, nb, kv.second, GGML_TYPE_F16));
             }
-            for (int64_t nb : {1, 4, 8, 16}) {
+            for (int64_t nb : {1, 3, 4, 5, 6, 8, 16}) {
                 test_cases.emplace_back(new test_flash_attn_ext_verify(256, 4, 6, kv.first, nb, kv.second, GGML_TYPE_Q8_0));
             }
         }

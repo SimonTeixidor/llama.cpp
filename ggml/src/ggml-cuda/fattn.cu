@@ -734,6 +734,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             !ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
         return Q->ne[1] >= 5 ? BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_TILE;
     }
+    // q8_0 K/V at 3..16 rows (the MTP catch-up): the same WMMA kernel, reading the q8_0 K/V natively (fattn-mma-f16.cuh).
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 &&
+            K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && ggml_cuda_fattn_q8_wmma_rows(Q->ne[1])) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
     // Only head sizes that have WMMA device code in flash_attn_ext_f16 (fattn-mma-f16.cuh, AMD_WMMA_AVAILABLE guard:
