@@ -305,6 +305,16 @@ extern "C" {
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API void                 ggml_backend_sched_prepare_inputs(ggml_backend_sched_t sched);
+
+    // Scheduler snapshots (llama graph cache): after ggml_backend_sched_alloc_graph, keep
+    // the scheduler state of that graph (splits, split-input copies, tensor -> backend map) so that the same, unchanged
+    // graph can later be computed again without splitting or allocating it. The graph's tensors keep the addresses of
+    // that allocation, so a snapshot is only valid while the compute buffers are not reallocated (restore checks this).
+    typedef struct ggml_backend_sched_snapshot * ggml_backend_sched_snapshot_t;
+    GGML_API ggml_backend_sched_snapshot_t ggml_backend_sched_snapshot_save   (ggml_backend_sched_t sched);
+    // returns false (and changes nothing) if the snapshot is stale; on success the graph is ready for compute
+    GGML_API bool                          ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap);
+    GGML_API void                          ggml_backend_sched_snapshot_free   (ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);

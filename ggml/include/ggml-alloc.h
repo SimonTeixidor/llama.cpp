@@ -72,6 +72,8 @@ GGML_API bool ggml_gallocr_reserve_n(
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
+// incremented whenever a backend buffer of the allocator is (re)allocated: tensor addresses handed out before are stale
+GGML_API uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc);
 
 GGML_API void ggml_gallocr_pin_tensor(ggml_gallocr_t galloc, struct ggml_tensor * t);
 GGML_API void ggml_gallocr_clear_pins(ggml_gallocr_t galloc);

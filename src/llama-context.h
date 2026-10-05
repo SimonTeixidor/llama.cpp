@@ -384,6 +384,25 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // graph cache (from ovn-g's LLAMA_GRAPH_CACHE): besides gf_res_prev[] keep up to graph_cache_max built graphs of at
+    // most 64 tokens, one per (graph type, n_tokens, n_outputs), each with a scheduler snapshot of its split and
+    // allocation, so that a speculative verify whose width changes every round recomputes the graph it built for that
+    // width last time with neither a rebuild nor a scheduler split/alloc. Most recently parked at the back.
+    // On when every layer is on a ROCm device (llama_model::layers_on_rocm), where it was measured.
+    static constexpr int graph_cache_max = 40;
+    bool graph_cache_enabled = false;
+    struct graph_cache_entry {
+        uint64_t                      key;
+        llm_graph_result_ptr          res;
+        ggml_backend_sched_snapshot_t snap;
+    };
+    std::vector<graph_cache_entry> graph_cache;
+    llm_graph_result_ptr          gf_res_gc;                  // the cache's current graph (graphs outside the cache use gf_res_prev[])
+    uint64_t                      gf_res_prev_key  = 0;       // key of the graph held by gf_res_gc (0 = none)
+    ggml_backend_sched_snapshot_t gf_res_prev_snap = nullptr; // its scheduler snapshot, if any
+    // drop every snapshot and make every cached graph rebuild on next use (the scheduler state they refer to is gone)
+    void graph_cache_clear();
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

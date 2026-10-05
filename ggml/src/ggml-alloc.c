@@ -525,6 +525,8 @@ struct ggml_gallocr {
 
     struct ggml_hash_set pinned;
     bool has_pinned;
+
+    uint64_t generation; // see ggml_gallocr_get_generation
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -1011,6 +1013,7 @@ static bool ggml_gallocr_reserve_n_impl(
                 galloc->buffers[i] = NULL;
             } else {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                galloc->generation++;
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
@@ -1169,6 +1172,10 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     return true;
+}
+
+uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc) {
+    return galloc->generation;
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
