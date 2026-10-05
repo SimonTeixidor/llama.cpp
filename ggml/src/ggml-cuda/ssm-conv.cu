@@ -157,7 +157,116 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
+// ggml_ssm_conv_rs: one thread per channel reads its d_conv-1 conv-state values from
+// cache row ids[0] and the new tokens from x (any strides), writes the convolution (+ SiLU) and the conv-state snapshot
+// windows. Replaces conv GET_ROWS + CONCAT + snapshot CPYs + SSM_CONV. The convolution is spelled as the fma chain from 0
+// that ssm_conv_f32 compiles to (as in gdn_decode_fused_cuda), plus the zero bias, so the output is bit-identical.
+// In place: every thread reads its own state values into registers before it writes any snapshot.
+template <int d_conv, bool apply_silu>
+static __global__ void ssm_conv_rs_f32(const char * __restrict__ x, const int64_t x_nb0, const int64_t x_nb1,
+                                       const float * __restrict__ w, const int64_t w_stride,
+                                       float * cache, const int64_t row_stride, const int32_t * __restrict__ ids,
+                                       const int n_slots, const int64_t rs_size, const int64_t row_out,
+                                       float * __restrict__ dst, const int64_t dst_stride, const int n_t, const int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) {
+        return;
+    }
+    constexpr int ns = d_conv - 1;
+
+    ggml_cuda_pdl_sync();
+
+    const float * st = cache + (int64_t) ids[0] * row_stride + (int64_t) c * ns;
+    float old[ns];
+#pragma unroll
+    for (int j = 0; j < ns; ++j) {
+        old[j] = st[j];
+    }
+    float wr[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        wr[j] = w[(int64_t) c * w_stride + j];
+    }
+
+    const char * xc = x + (int64_t) c * x_nb1;
+
+    float win[d_conv];
+#pragma unroll
+    for (int j = 0; j < ns; ++j) {
+        win[j] = old[j];
+    }
+    for (int i = 0; i < n_t; ++i) {
+        win[d_conv - 1] = *(const float *) (xc + (int64_t) i * x_nb0);
+        float sumf = fmaf(win[0], wr[0], 0.0f);
+#pragma unroll
+        for (int j = 1; j < d_conv; ++j) {
+            sumf = fmaf(win[j], wr[j], sumf);
+        }
+        sumf += 0.0f; // the (absent) bias of ssm_conv_f32
+        dst[(int64_t) i * dst_stride + c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; ++j) {
+            win[j] = win[j + 1];
+        }
+    }
+
+    // snapshot slot s: columns max(0, n_t - s) .. + ns - 1 of [old | x]
+    for (int s = 0; s < n_slots; ++s) {
+        const int start = max(0, n_t - s);
+        float * out = cache + ((int64_t) s * rs_size + row_out) * row_stride + (int64_t) c * ns;
+#pragma unroll
+        for (int j = 0; j < ns; ++j) {
+            const int col = start + j;
+            out[j] = col < ns ? old[col] : *(const float *) (xc + (int64_t) (col - ns) * x_nb0);
+        }
+    }
+}
+
+static void ggml_cuda_op_ssm_conv_rs(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * w     = dst->src[1];
+    const ggml_tensor * cache = dst->src[2];
+    const ggml_tensor * ids   = dst->src[3];
+    const ggml_tensor * out   = silu_dst != nullptr ? silu_dst : dst;
+
+    const int     d_conv  = (int) w->ne[0];
+    const int     C       = (int) w->ne[1];
+    const int     n_t     = (int) x->ne[0];
+    const int     n_slots = ggml_get_op_params_i32(dst, 1);
+    const int64_t rs_size = ggml_get_op_params_i32(dst, 2);
+    const int64_t row_out = ggml_get_op_params_i32(dst, 3);
+
+    GGML_ASSERT(out->type == GGML_TYPE_F32 && out->nb[0] == sizeof(float) && out->ne[0] == C && out->ne[1] == n_t);
+    GGML_ASSERT(w->nb[0] == sizeof(float) && cache->nb[0] == sizeof(float) && ids->type == GGML_TYPE_I32);
+
+    const int threads = 128;
+    const dim3 blocks((C + threads - 1) / threads, 1, 1);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(blocks, threads, 0, ctx.stream());
+
+    auto launch = [&](auto DC, auto SILU) {
+        constexpr int  kd = decltype(DC)::value;
+        constexpr bool ks = decltype(SILU)::value;
+        ggml_cuda_kernel_launch(ssm_conv_rs_f32<kd, ks>, lp,
+            (const char *) x->data, (int64_t) x->nb[0], (int64_t) x->nb[1],
+            (const float *) w->data, (int64_t) (w->nb[1] / sizeof(float)),
+            (float *) cache->data, (int64_t) (cache->nb[1] / sizeof(float)), (const int32_t *) ids->data,
+            n_slots, rs_size, row_out, (float *) out->data, (int64_t) (out->nb[1] / sizeof(float)), n_t, C);
+    };
+    GGML_ASSERT(d_conv == 4 && "ggml_ssm_conv_rs: only d_conv == 4");
+    if (silu_dst != nullptr) {
+        launch(std::integral_constant<int, 4>{}, std::true_type{});
+    } else {
+        launch(std::integral_constant<int, 4>{}, std::false_type{});
+    }
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
+    if (ggml_get_op_params_i32(dst, 0) == 1) {
+        GGML_ASSERT(bias_add_node == nullptr);
+        ggml_cuda_op_ssm_conv_rs(ctx, dst, silu_dst);
+        return;
+    }
+
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
     const bool fuse_bias = bias_add_node != nullptr;

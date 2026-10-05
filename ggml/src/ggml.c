@@ -5761,6 +5761,47 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+// ggml_ssm_conv_rs
+
+struct ggml_tensor * ggml_ssm_conv_rs(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * cache,
+        struct ggml_tensor  * ids,
+        int32_t               n_slots,
+        int32_t               rs_size,
+        int32_t               row_out) {
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32 && cache->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_nelements(ids) == 1);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[0];
+
+    GGML_ASSERT(x->ne[1] == d_inner && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(x->nb[0] % sizeof(float) == 0 && x->nb[1] % sizeof(float) == 0);
+    GGML_ASSERT(cache->ne[0] == (d_conv - 1) * d_inner && cache->nb[0] == sizeof(float));
+    GGML_ASSERT(n_slots >= 1 && rs_size >= 1 && row_out >= 0);
+    GGML_ASSERT((int64_t) (n_slots - 1) * rs_size + row_out < cache->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, 1);
+
+    ggml_set_op_params_i32(result, 0, 1); // mode: cache-reading conv with snapshot writes
+    ggml_set_op_params_i32(result, 1, n_slots);
+    ggml_set_op_params_i32(result, 2, rs_size);
+    ggml_set_op_params_i32(result, 3, row_out);
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = cache;
+    result->src[3] = ids;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(

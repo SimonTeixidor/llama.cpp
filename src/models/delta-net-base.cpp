@@ -534,6 +534,41 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+ggml_tensor * llm_build_delta_net_base::build_conv_fused(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        conv_states_all,
+        ggml_tensor *        qkv_mixed,
+        ggml_tensor *        conv_kernel,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    if (!mctx_cur->fused_rs_ops() || cparams.n_rs_seq == 0 || ubatch.n_seqs != 1 || mctx_cur->get_n_rs() != 1 ||
+            conv_kernel->ne[0] != 4 || qkv_mixed->ne[2] != 1 || qkv_mixed->ne[3] != 1) {
+        return nullptr;
+    }
+
+    const int64_t n_t      = qkv_mixed->ne[1];
+    const int64_t mem_size = mctx_cur->get_size();
+    const int64_t kv_head  = mctx_cur->get_head();
+    const int32_t rs_zero  = mctx_cur->get_rs_z();
+    const int64_t K        = (int64_t) cparams.n_rs_seq + 1;
+
+    // build_rs's clear of a fresh state (no-op view when rs_zero < 0); its GET_ROWS is folded into the op
+    ggml_tensor * states = ggml_reshape_2d(ctx0, conv_states_all, hparams.n_embd_r(), conv_states_all->ne[1]);
+    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, hparams.n_embd_r()*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+
+    // the snapshot slots s <= n_t, as build_conv_state writes them
+    const int64_t n_slots = std::min<int64_t>(K, n_t + 1);
+
+    ggml_tensor * x_t = ggml_transpose(ctx0, qkv_mixed); // [n_t, channels, 1]
+    ggml_tensor * out = ggml_ssm_conv_rs(ctx0, x_t, conv_kernel, states, inp->s_copy_main,
+            (int32_t) n_slots, (int32_t) mem_size, (int32_t) kv_head);
+    cb(out, "conv_output_raw_fused", il);
+
+    return out;
+}
+
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,

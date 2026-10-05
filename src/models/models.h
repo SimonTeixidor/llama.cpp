@@ -86,6 +86,17 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // the conv-state read, concat, snapshot writes and ssm_conv of build_conv_state + ggml_ssm_conv as one op
+    // (ggml_ssm_conv_rs). Returns the raw conv output (channels, n_seq_tokens, 1), or nullptr when not applicable
+    // (no rollback snapshots, more than one sequence, d_conv != 4, or the cache not on ROCm devices), in which case use
+    // build_conv_state + ggml_ssm_conv.
+    ggml_tensor * build_conv_fused(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        conv_states_all,
+            ggml_tensor *        qkv_mixed,
+            ggml_tensor *        conv_kernel,
+            int                  il);
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     ggml_tensor * build_recurrent_attn(

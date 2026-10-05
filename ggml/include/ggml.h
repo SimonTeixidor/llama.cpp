@@ -2559,6 +2559,24 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // ggml_ssm_conv for one sequence that reads its conv state straight from a recurrent cache instead of a concatenated
+    // window, and also writes the conv-state snapshot windows (CUDA/HIP backend only; the CPU backend asserts):
+    //   x     : [n_t, d_inner, 1] new tokens (any strides, e.g. a transposed view)
+    //   c     : [d_conv, d_inner]  conv weight
+    //   cache : [(d_conv-1)*d_inner, rows] recurrent conv cache; the state is read from row ids[0]
+    //   ids   : I32 [1]
+    // snapshot slot s in [0, n_slots) gets columns max(0, n_t - s) .. max(0, n_t - s) + d_conv - 2 of [state | x], written
+    // to cache row s*rs_size + row_out. Result: [d_inner, n_t, 1], as ggml_ssm_conv on the concatenated window.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_rs(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * ids,
+            int32_t               n_slots,
+            int32_t               rs_size,
+            int32_t               row_out);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

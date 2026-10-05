@@ -9822,6 +9822,8 @@ static void ggml_compute_forward_ssm_conv_f32(
 void ggml_compute_forward_ssm_conv(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // ggml_ssm_conv_rs (op_params[0] == 1) has a CUDA/HIP kernel only
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == 0 && "ggml_ssm_conv_rs is not implemented on the CPU backend");
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32:
             {

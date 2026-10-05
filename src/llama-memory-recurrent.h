@@ -78,6 +78,10 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // the cache and every layer are on ROCm devices: the graph may use the ops that have CUDA/HIP kernels only and were
+    // measured there (ggml_ssm_conv_rs)
+    bool fused_rs_ops = false;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -181,6 +185,9 @@ public:
 
     // s_copy(i) == head + i for all i < n_seqs, without side effects; always false with n_rs_seq > 0
     bool is_s_copy_main_identity(uint32_t n_seqs) const;
+
+    // see llama_memory_recurrent::fused_rs_ops
+    bool fused_rs_ops() const;
 
 private:
     const llama_memory_status status;

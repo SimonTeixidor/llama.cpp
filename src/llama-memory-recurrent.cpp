@@ -35,6 +35,8 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
 
+    fused_rs_ops = offload && model.layers_on_rocm();
+
     cells.clear();
     cells.resize(mem_size);
 
@@ -1351,6 +1353,10 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
+}
+
+bool llama_memory_recurrent_context::fused_rs_ops() const {
+    return mem->fused_rs_ops;
 }
 
 bool llama_memory_recurrent_context::is_s_copy_main_identity(uint32_t n_seqs) const {
