@@ -501,9 +501,19 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
+        // write only the snapshot slots s <= n_seq_tokens. Slot n_seq_tokens holds the pre-batch window (rollback of
+        // the whole batch) and is kept, so every rollback r <= n_seq_tokens reads exactly what all K slots would hold;
+        // slots s > n_seq_tokens would get the same clamped pre-batch window again, which no rollback inside this
+        // batch selects. Exact for every rollback inside the last batch.
+        const int64_t n_seq_tokens_conv = conv_input->ne[0] - conv_states->ne[0];
+
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
+
+            if (s_slot > n_seq_tokens_conv) {
+                continue;
+            }
 
             ggml_tensor * conv_state_last =
                 ggml_view_3d(ctx0, conv_input,
