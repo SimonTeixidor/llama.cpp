@@ -816,11 +816,39 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+// RDNA3.5: buffer memsets (the KV-cache zeroing of freed cells, one per layer and K/V at every speculative rollback)
+// are enqueued without a host sync each; an event recorded after them makes every backend stream that touches the
+// device wait for them before its next work (graph compute, async copies, synchronize). Same memsets, same order
+// relative to their consumers, no host blocking.
+struct ggml_cuda_memset_state {
+    cudaEvent_t ev  = nullptr;
+    uint64_t    gen = 0;
+};
+static ggml_cuda_memset_state g_cuda_memset_async[GGML_CUDA_MAX_DEVICES];
+
+// make cuda_ctx's stream wait for every async buffer memset issued so far on its device
+static void ggml_cuda_memset_join(ggml_backend_cuda_context * cuda_ctx) {
+    auto & st = g_cuda_memset_async[cuda_ctx->device];
+    if (st.gen != cuda_ctx->memset_gen) {
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), st.ev, 0));
+        cuda_ctx->memset_gen = st.gen;
+    }
+}
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx->device].cc)) {
+        auto & st = g_cuda_memset_async[ctx->device];
+        if (st.ev == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&st.ev, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(st.ev, cudaStreamPerThread));
+        st.gen++;
+        return;
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -2557,6 +2585,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_memset_join(cuda_ctx);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -2566,6 +2595,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_memset_join(cuda_ctx);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -2576,6 +2606,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_memset_join(cuda_ctx);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2587,6 +2618,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_memset_join(cuda_ctx);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -2602,6 +2634,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
         return false;
     }
+
+    ggml_cuda_memset_join((ggml_backend_cuda_context *) backend_src->context);
+    ggml_cuda_memset_join((ggml_backend_cuda_context *) backend_dst->context);
 
     // device -> device copy
     ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
@@ -2652,6 +2687,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    ggml_cuda_memset_join(cuda_ctx);
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
@@ -7519,6 +7556,7 @@ struct ggml_cuda_step_fence {
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_memset_join(cuda_ctx);
     if (ggml_cuda_mmb_marks_count(*cuda_ctx) > 0) {
         const uint64_t sig = ggml_cuda_graph_sig(cgraph);
         if (std::find(cuda_ctx->mmb_graph_sigs.begin(), cuda_ctx->mmb_graph_sigs.end(), sig) == cuda_ctx->mmb_graph_sigs.end()) {
