@@ -2257,6 +2257,19 @@ ggml_backend_dev_t llama_model::dev_output() const {
     return pimpl->dev_output.dev;
 }
 
+bool llama_model::layers_on_rocm() const {
+    if (pimpl->dev_layer.empty()) {
+        return false;
+    }
+    for (const auto & dl : pimpl->dev_layer) {
+        // the ROCm registry has only GPU devices (an APU such as gfx1151 reports GGML_BACKEND_DEVICE_TYPE_IGPU)
+        if (dl.dev == nullptr || std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dl.dev)), "ROCm") != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template<typename F>
 static bool buft_supported(ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev, F & fn) {
     ggml_init_params params = {

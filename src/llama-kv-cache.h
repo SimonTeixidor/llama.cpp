@@ -411,6 +411,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_kv_size() const; // total cells of the cache (the cap of the fixed KQ-mask bucket)
 
     ggml_type type_k() const;
     ggml_type type_v() const;

@@ -41,6 +41,7 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
+    bool kq_mask_fixed = false; // with flash attention, allocate the KQ mask at a fixed 8192-cell bucket (ROCm layers)
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;

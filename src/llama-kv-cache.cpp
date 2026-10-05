@@ -2979,6 +2979,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_kv_size() const {
+    return kv->get_size();
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }

@@ -233,6 +233,9 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    // the FA KQ mask at a fixed bucket keeps the verify graph's allocation independent of n_kv (see llama-graph.cpp)
+    cparams.kq_mask_fixed = model.layers_on_rocm();
+
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;

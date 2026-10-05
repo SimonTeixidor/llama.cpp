@@ -779,6 +779,10 @@ struct llama_model {
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
 
+    // true when every layer runs on a ROCm (HIP) device: the scope of the graph-level spec-decode defaults that were
+    // only measured there (fixed KQ-mask bucket, graph cache, fused conv state, lazy delta-net state)
+    bool layers_on_rocm() const;
+
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;

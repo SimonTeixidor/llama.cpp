@@ -26,6 +26,24 @@
 
 // dedup helpers
 
+// With flash attention on ROCm layers (cparams.kq_mask_fixed) the KQ mask (and its GPU split-input copy) is allocated
+// as [cap, n_tokens] with cap = n_kv rounded up to a fixed bucket of 8192 cells, clamped to the cache size, so that its
+// size does not change at every n_kv step. Before, the mask's growth shifted the gallocr layout of everything after it,
+// so a data pointer of the warm verify graph moved at nearly every n_kv step and the HIP FA-node graph update (which
+// requires an FA-only change) never engaged. FA reads the mask through its row stride and only up to K->ne[1] columns;
+// set_input fills the extra columns as the empty cells they are (-inf). The real n_kv is kept in op_params[0] of the
+// mask leaf, so graph reuse still checks it.
+static constexpr int64_t LLAMA_KQ_MASK_BUCKET = 8192;
+
+static bool kq_mask_fixed(const llama_cparams & cparams) {
+    return cparams.flash_attn && cparams.kq_mask_fixed;
+}
+
+static int64_t kq_mask_cap(int64_t n_kv, int64_t kv_size) {
+    const int64_t cap = ((n_kv + LLAMA_KQ_MASK_BUCKET - 1) / LLAMA_KQ_MASK_BUCKET) * LLAMA_KQ_MASK_BUCKET;
+    return std::max<int64_t>(n_kv, std::min<int64_t>(cap, kv_size));
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -39,9 +57,12 @@ static ggml_tensor * build_attn_inp_kq_mask(
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+    const int64_t ne0 = kq_mask_fixed(cparams) ? kq_mask_cap(n_kv, mctx->get_kv_size()) : (int64_t) n_kv;
+
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, ne0, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, name);
+    ((int32_t *) res->op_params)[0] = (int32_t) n_kv;
 
     return res;
 }
@@ -57,7 +78,12 @@ static bool can_reuse_kq_mask(
 
     bool res = true;
 
-    res &= (kq_mask->ne[0] == n_kv);
+    if (kq_mask_fixed(cparams)) {
+        res &= (kq_mask->ne[0] == kq_mask_cap(n_kv, mctx->get_kv_size()));
+        res &= (((const int32_t *) kq_mask->op_params)[0] == (int32_t) n_kv);
+    } else {
+        res &= (kq_mask->ne[0] == n_kv);
+    }
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
