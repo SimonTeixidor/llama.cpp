@@ -6538,6 +6538,24 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+void ggml_gated_delta_net_set_lazy(
+        struct ggml_tensor * gdn,
+        struct ggml_tensor * log,
+        struct ggml_tensor * ctl,
+        int32_t              mode) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET);
+    GGML_ASSERT(mode == 1 || mode == 2);
+    GGML_ASSERT(mode == 2 || ggml_get_op_params_i32(gdn, 0) == 1);
+    GGML_ASSERT(log->type == GGML_TYPE_F32 && log->ne[2] == 2 && ggml_is_contiguous(log));
+    GGML_ASSERT(ctl->type == GGML_TYPE_I32 && ggml_nelements(ctl) >= 3);
+    GGML_ASSERT(gdn->src[2]->ne[3] == 1 && gdn->src[3]->ne[0] == 1);
+
+    ggml_set_op_params_i32(gdn, 1, mode);
+    ggml_set_op_params_i32(gdn, 2, (int32_t) log->ne[1]);
+    gdn->src[6] = log;
+    gdn->src[7] = ctl;
+}
+
 void ggml_gated_delta_net_set_state_ids(
         struct ggml_tensor * gdn,
         struct ggml_tensor * ids) {

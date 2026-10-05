@@ -37,6 +37,17 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     fused_rs_ops = offload && model.layers_on_rocm();
 
+    {
+        const bool arch_ok = model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE;
+        lz_enabled = fused_rs_ops && arch_ok && n_rs_seq > 0 && n_seq_max == 1 && mem_size == 1 && hparams.ssm_dt_rank > 0;
+        if (lz_enabled) {
+            lz_L = n_rs_seq + 1;
+            lz_E = (int64_t) hparams.ssm_n_group * hparams.ssm_d_state + (int64_t) hparams.ssm_dt_rank * hparams.ssm_d_state +
+                   2 * (int64_t) hparams.ssm_dt_rank;
+            LLAMA_LOG_INFO("%s: lazy delta-net state: log %u tokens x %lld floats x 2 per layer\n", __func__, lz_L, (long long) lz_E);
+        }
+    }
+
     cells.clear();
     cells.resize(mem_size);
 
@@ -54,7 +65,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(((hparams.ple_conv_state() > 0 ? 3u : 2u) + (lz_enabled ? 1u : 0u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -75,6 +86,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    lz_log_l.resize(n_layer, nullptr);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -107,6 +119,12 @@ llama_memory_recurrent::llama_memory_recurrent(
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+
+        if (lz_enabled) {
+            ggml_tensor * lg = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, lz_E, lz_L, 2);
+            ggml_format_name(lg, "cache_lz_log_l%d", i);
+            lz_log_l[i] = lg;
+        }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
@@ -158,6 +176,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    lz_reset();
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -179,6 +198,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        lz_reset();
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -196,9 +216,14 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
-                const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                const bool pending = rs_idx[seq_id] != 0 || (lz_enabled && lz.r != 0);
+                // lazy delta-net state: after a lazy batch only rollbacks inside it can be replayed
+                const bool lz_ok = !lz_enabled || !lz.last_lazy || rollback <= (llama_pos) lz.n_last;
+                if (!pending && lz_ok && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
+                    if (lz_enabled) {
+                        lz.r = (uint32_t) rollback;
+                    }
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -207,6 +232,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
                 tail_id = -1;
+                lz_reset();
             }
         }
     } else {
@@ -780,6 +806,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
+    std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data_s; // same for the s rows (lazy delta-net state: plane 0)
     uint32_t cell_count = 0;
 
     // Count the number of cells with the specified seq_id
@@ -818,6 +845,13 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
             } else {
                 cell_ranges_data.back().second++;
             }
+            // lazy delta-net state: the delta-net state row is plane 0 after a lazy batch (plus the pending replay)
+            const uint32_t cell_id_s = (lz_enabled && lz.last_lazy ? 0 : rs_idx_cur) * size + (cell.src >= 0 ? cell.src : (int32_t) i);
+            if (cell_ranges_data_s.empty() || cell_ranges_data_s.back().second != cell_id_s) {
+                cell_ranges_data_s.emplace_back(cell_id_s, cell_id_s + 1);
+            } else {
+                cell_ranges_data_s.back().second++;
+            }
 
             if (cell_range_begin == size) {
                 cell_range_begin = i;
@@ -853,7 +887,23 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges_data);
+    state_write_data(io, cell_ranges_data, cell_ranges_data_s);
+
+    // lazy delta-net state: the pending replay (count + logged inputs) travels with the state
+    if (lz_enabled) {
+        GGML_ASSERT(cell_count <= 1);
+        const uint32_t n_pend = cell_count == 1 && lz.last_lazy ? lz.n_last - lz.r : 0;
+        io.write(&n_pend, sizeof(n_pend));
+        if (n_pend > 0) {
+            const size_t tok_bytes = (size_t) lz_E * sizeof(float);
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                if (lz_log_l[il] == nullptr) {
+                    continue;
+                }
+                io.write_tensor(lz_log_l[il], (size_t) lz.parity * lz_L * tok_bytes, n_pend * tok_bytes);
+            }
+        }
+    }
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -873,6 +923,26 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     try {
         res = res && state_read_data(io, cell_count);
+        // lazy delta-net state: restore the pending replay into log half 0 (the s rows went to plane 0)
+        if (res && lz_enabled) {
+            uint32_t n_pend = 0;
+            io.read(&n_pend, sizeof(n_pend));
+            lz_reset();
+            if (n_pend > lz_L || (n_pend > 0 && cell_count != 1)) {
+                res = false;
+            } else if (n_pend > 0) {
+                const size_t tok_bytes = (size_t) lz_E * sizeof(float);
+                for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                    if (lz_log_l[il] == nullptr) {
+                        continue;
+                    }
+                    io.read_tensor(lz_log_l[il], 0, n_pend * tok_bytes);
+                }
+                lz.last_lazy = true;
+                lz.n_last    = n_pend;
+                lz.parity    = 0;
+            }
+        }
     } catch (...) {
         res = false;
     }
@@ -906,7 +976,8 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                                              const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s) const {
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
 
@@ -962,7 +1033,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 
             // Write each logical cell row range. With pending recurrent rollback,
             // the logical current state may live in a rollback snapshot plane.
-            for (const auto & range : cell_ranges) {
+            for (const auto & range : cell_ranges_s) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
                 io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
@@ -1371,6 +1442,41 @@ bool llama_memory_recurrent_context::is_s_copy_main_identity(uint32_t n_seqs) co
         }
     }
     return true;
+}
+
+bool llama_memory_recurrent_context::lz_enabled() const {
+    return mem->lz_enabled;
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_lz_log(int32_t il) const {
+    return mem->lz_log_l[il];
+}
+
+bool llama_memory_recurrent_context::lz_batch(uint32_t n_seq_tokens) const {
+    return mem->lz_batch(n_seq_tokens);
+}
+
+void llama_memory_recurrent_context::set_input_lz(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(mem->lz_enabled && ubatch->n_seqs == 1 && ggml_nelements(dst) == 4);
+    auto & lz = mem->lz;
+
+    const int32_t src0 = mem->cells[mem->head].src0;
+    int32_t * data = (int32_t *) dst->data;
+    data[0] = (int32_t) ((lz.last_lazy ? 0 : lz.r) * mem->size) + src0;
+    data[1] = lz.last_lazy ? (int32_t) (lz.n_last - lz.r) : 0;
+    data[2] = (int32_t) lz.parity;
+    data[3] = mem->lz_batch(ubatch->n_seq_tokens) ? 1 : 0;
+
+    // this ubatch's effect on the lazy state
+    if (data[3]) {
+        lz.last_lazy = true;
+        lz.n_last    = ubatch->n_seq_tokens;
+        lz.parity   ^= 1;
+    } else {
+        lz.last_lazy = false;
+        lz.n_last    = 0;
+    }
+    lz.r = 0;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

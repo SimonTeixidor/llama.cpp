@@ -79,8 +79,27 @@ public:
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // the cache and every layer are on ROCm devices: the graph may use the ops that have CUDA/HIP kernels only and were
-    // measured there (ggml_ssm_conv_rs)
+    // measured there (ggml_ssm_conv_rs, the lazy gated_delta_net state)
     bool fused_rs_ops = false;
+
+    // lazy delta-net state (qwen35/qwen35moe, one sequence, one cell, n_rs_seq > 0, fused_rs_ops): the delta-net state
+    // keeps one row (plane 0 = the state at the start of the last lazy batch) plus a log of that batch's inputs; a
+    // rollback of r tokens becomes a replay of n_last - r logged tokens inside the next GDN kernel. Batches of
+    // 1..lz_max_batch tokens are lazy; longer ones keep the snapshot planes (after materialising a pending replay).
+    // The conv state keeps its snapshot planes (rs_idx).
+    bool     lz_enabled = false;
+    uint32_t lz_L       = 0;   // log capacity in tokens
+    int64_t  lz_E       = 0;   // log floats per token
+    struct lz_state {
+        bool     last_lazy = false; // the last batch was lazy: plane 0 holds its start state, the log its inputs
+        uint32_t n_last    = 0;     // tokens of the last lazy batch
+        uint32_t r         = 0;     // pending rollback (single use, like rs_idx)
+        uint32_t parity    = 0;     // log half holding the last lazy batch
+    } lz;
+    std::vector<ggml_tensor *> lz_log_l; // per layer F32 [lz_E, lz_L, 2]
+    static constexpr uint32_t lz_max_batch = 15; // the generic GDN kernel path (the rs kernel starts at 16 tokens)
+    bool lz_batch(uint32_t n_seq_tokens) const { return lz_enabled && n_seq_tokens >= 1 && n_seq_tokens <= lz_max_batch; }
+    void lz_reset() { lz = lz_state(); }
 
     // computed before each graph build
     uint32_t n = 0;
@@ -134,7 +153,8 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                          const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -183,7 +203,16 @@ public:
 
     int32_t s_copy(int i) const;
 
-    // s_copy(i) == head + i for all i < n_seqs, without side effects; always false with n_rs_seq > 0
+    // lazy delta-net state: fills ctl = {ssm row, n_replay, parity, lazy} for this ubatch and advances it
+    // (side effect, like s_copy). See llama_memory_recurrent::lz_*.
+    bool lz_enabled() const;
+    ggml_tensor * get_lz_log(int32_t il) const;
+    bool lz_batch(uint32_t n_seq_tokens) const;
+    void set_input_lz(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // true when the main state rows are already in the cache slots that this ubatch will write
+    // back to, i.e. s_copy(i) == head + i for all i < n_seqs. build_rs() can then hand out a view
+    // of the cache instead of a get_rows copy. Never true while rollback snapshots are kept.
     bool is_s_copy_main_identity(uint32_t n_seqs) const;
 
     // see llama_memory_recurrent::fused_rs_ops

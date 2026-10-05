@@ -277,6 +277,10 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // lazy delta-net state: I32 [4] = {ssm row, n_replay, parity, lazy} (nullptr when it is off)
+    ggml_tensor * lz = nullptr;
+    ggml_tensor * lz_row = nullptr; // view of lz[0], shared by every layer's state GET_ROWS (ids of the GDN)
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

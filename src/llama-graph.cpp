@@ -369,6 +369,11 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    if (lz && lz->buffer) {
+        llama_host_write(lz);
+        mctx->set_input_lz(lz, ubatch);
+    }
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1162,6 +1167,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    if (inp_rs->lz && inp_rs->lz->buffer) {
+        llama_host_write(inp_rs->lz);
+        mctx->get_recr()->set_input_lz(inp_rs->lz, ubatch);
+    }
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1212,6 +1222,11 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
+    }
+
+    if (inp_rs->lz && inp_rs->lz->buffer) {
+        llama_host_write(inp_rs->lz);
+        mctx->get_recr()->set_input_lz(inp_rs->lz, ubatch);
     }
 }
 
@@ -1290,6 +1305,11 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
+    }
+
+    if (inp_rs->lz && inp_rs->lz->buffer) {
+        llama_host_write(inp_rs->lz);
+        mctx->get_recr()->set_input_lz(inp_rs->lz, ubatch);
     }
 }
 
@@ -3619,6 +3639,13 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
     inp->s_copy_main_identity = mctx_cur->is_s_copy_main_identity(n_seqs);
+
+    if (mctx_cur->lz_enabled() && n_seqs == 1) {
+        inp->lz = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4);
+        ggml_set_input(inp->lz);
+        ggml_set_name(inp->lz, "inp_lz");
+        inp->lz_row = ggml_view_1d(ctx0, inp->lz, n_seqs, 0);
+    }
 
     return inp;
 }

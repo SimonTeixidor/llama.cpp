@@ -86,6 +86,12 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // the delta-net state row(s) for this ubatch (build_rs; the lazy delta-net state uses its own row index)
+    ggml_tensor * build_ssm_state(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        ssm_states_all,
+            int64_t              n_seqs);
+
     // the conv-state read, concat, snapshot writes and ssm_conv of build_conv_state + ggml_ssm_conv as one op
     // (ggml_ssm_conv_rs). Returns the raw conv output (channels, n_seq_tokens, 1), or nullptr when not applicable
     // (no rollback snapshots, more than one sequence, d_conv != 4, or the cache not on ROCm devices), in which case use

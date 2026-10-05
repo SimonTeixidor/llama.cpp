@@ -2710,6 +2710,16 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // lazy rollback state (CUDA/HIP backend only, non-KDA, one sequence; the CPU backend asserts):
+    //   mode 1: replay the n_replay logged tokens onto the input state, store that state into the state output
+    //           (K must be 1), process the batch while logging its k, v, exp(g), beta; no final state is stored.
+    //   mode 2: replay a pending log onto the input state in place, then run as usual (snapshots).
+    //   log : F32 [H_k*S_v + H*S_v + 2*H, L, 2] persistent, ctl: I32 [4] = {row, n_replay, parity, -}
+    GGML_API void ggml_gated_delta_net_set_lazy(
+            struct ggml_tensor * gdn,
+            struct ggml_tensor * log,
+            struct ggml_tensor * ctl,
+            int32_t              mode);
     // optional: the I32 row ids the state was gathered with (get_rows(cache, ids) -> state). A backend may then read the
     // state row straight from the cache; making the ids a src keeps them allocated until this node has run.
     GGML_API void ggml_gated_delta_net_set_state_ids(

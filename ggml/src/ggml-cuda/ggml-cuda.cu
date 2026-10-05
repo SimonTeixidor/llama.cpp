@@ -3463,7 +3463,7 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     const int64_t H_v = v_view->ne[1];
     const int64_t H_k = l2_q->ne[1];
     if (S != 128 || H_k <= 0 || H_v % H_k != 0 || v_view->ne[2] != n_tokens || v_view->ne[3] != 1 ||
-        2 * S * H_k + S * H_v != C) {
+        2 * S * H_k + S * H_v != C || ggml_get_op_params_i32(gdn, 1) != 0) {
         return 0;
     }
 
@@ -4845,7 +4845,8 @@ static int ggml_cuda_gdn_state_direct(const ggml_backend_cuda_context * cuda_ctx
         return -1;
     }
     const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
-    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) <= 1) {
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+            (ggml_get_op_params_i32(gdn, 0) <= 1 && ggml_get_op_params_i32(gdn, 1) == 0)) { // K > 1, or the lazy state
         return -1;
     }
     const ggml_tensor * src_v = gdn->src[2];

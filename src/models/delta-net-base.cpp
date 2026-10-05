@@ -534,6 +534,20 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+ggml_tensor * llm_build_delta_net_base::build_ssm_state(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        ssm_states_all,
+        int64_t              n_seqs) {
+    if (inp->lz != nullptr) {
+        // lazy delta-net state: the state row differs from the conv row after a lazy batch (plane 0 + replay)
+        const auto * mctx_cur = inp->mctx;
+        return build_rs(ssm_states_all, inp->lz_row, inp->s_copy_extra, hparams.n_embd_s(), n_seqs,
+                mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z(),
+                ggml_get_rows, /*main_inplace=*/false);
+    }
+    return build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, ggml_get_rows, /*allow_inplace=*/true);
+}
+
 ggml_tensor * llm_build_delta_net_base::build_conv_fused(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
@@ -606,13 +620,21 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+
+    // lazy delta-net state: a lazy batch stores one state (its start state, after replaying the pending log) into
+    // plane 0; longer batches keep the K snapshot slots after materialising a pending replay in place
+    const bool lz_on   = inp->lz != nullptr;
+    const bool lz_lazy = lz_on && mctx_cur->lz_batch((uint32_t) n_seq_tokens);
+    const int64_t K = lz_lazy ? 1 : cparams.n_rs_seq + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     // the rows build_rs gathered s with: lets a backend read the state from the cache row directly (ggml-cuda
     // GDN_STATE_DIRECT) with the ids kept alive by this node instead of only by the GET_ROWS
-    ggml_gated_delta_net_set_state_ids(gdn_out, inp->s_copy_main);
+    ggml_gated_delta_net_set_state_ids(gdn_out, lz_on ? inp->lz_row : inp->s_copy_main);
+    if (lz_on) {
+        ggml_gated_delta_net_set_lazy(gdn_out, mctx_cur->get_lz_log(il), inp->lz, lz_lazy ? 1 : 2);
+    }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

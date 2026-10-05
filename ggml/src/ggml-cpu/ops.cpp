@@ -11158,6 +11158,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
 void ggml_compute_forward_gated_delta_net(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) == 0 && "the lazy gated_delta_net state is not implemented on the CPU backend");
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {
