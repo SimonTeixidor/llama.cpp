@@ -34,6 +34,8 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    n_rs_snap_max = n_rs_seq > 0 ? llm_arch_rs_snap_max_seq_tokens(model.arch) : 0;
+    rs_snap_ok.assign(n_seq_max, true);
 
     fused_rs_ops = offload && model.layers_on_rocm();
 
@@ -46,6 +48,10 @@ llama_memory_recurrent::llama_memory_recurrent(
                    2 * (int64_t) hparams.ssm_dt_rank;
             LLAMA_LOG_INFO("%s: lazy delta-net state: log %u tokens x %lld floats x 2 per layer\n", __func__, lz_L, (long long) lz_E);
         }
+    }
+    // a prefill ubatch without snapshots would skip the materialisation of a pending lazy replay: keep them all
+    if (lz_enabled) {
+        n_rs_snap_max = 0;
     }
 
     cells.clear();
@@ -177,6 +183,7 @@ void llama_memory_recurrent::clear(bool data) {
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
     lz_reset();
+    std::fill(rs_snap_ok.begin(), rs_snap_ok.end(), true);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -219,7 +226,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const bool pending = rs_idx[seq_id] != 0 || (lz_enabled && lz.r != 0);
                 // lazy delta-net state: after a lazy batch only rollbacks inside it can be replayed
                 const bool lz_ok = !lz_enabled || !lz.last_lazy || rollback <= (llama_pos) lz.n_last;
-                if (!pending && lz_ok && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                if (!pending && lz_ok && rs_snap_ok[seq_id] && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     if (lz_enabled) {
                         lz.r = (uint32_t) rollback;
@@ -307,6 +314,9 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
+        }
+        if ((size_t) seq_id_dst < rs_snap_ok.size() && (size_t) seq_id_src < rs_snap_ok.size()) {
+            rs_snap_ok[seq_id_dst] = rs_snap_ok[seq_id_src];
         }
     }
 }
@@ -429,6 +439,19 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+void llama_memory_recurrent::set_rs_snap_ok(const llama_ubatch & ubatch) {
+    const bool ok = n_rs_snap_max == 0 || ubatch.n_seq_tokens < n_rs_snap_max;
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        const uint32_t i = s*ubatch.n_seq_tokens;
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            if (seq_id >= 0 && (size_t) seq_id < rs_snap_ok.size()) {
+                rs_snap_ok[seq_id] = ok;
+            }
+        }
+    }
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
@@ -954,6 +977,12 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     if (n_rs_seq != 0) {
         set_rs_idx(seq_id, 0);
+        // only the current state is restored, not the rollback snapshots
+        if (seq_id < 0) {
+            std::fill(rs_snap_ok.begin(), rs_snap_ok.end(), false);
+        } else if ((size_t) seq_id < rs_snap_ok.size()) {
+            rs_snap_ok[seq_id] = false;
+        }
     }
 }
 
@@ -1384,6 +1413,7 @@ bool llama_memory_recurrent_context::apply() {
     }
 
     mem->find_slot(ubatches[i_next]);
+    mem->set_rs_snap_ok(ubatches[i_next]);
 
     return true;
 }
@@ -1477,6 +1507,10 @@ void llama_memory_recurrent_context::set_input_lz(ggml_tensor * dst, const llama
         lz.n_last    = 0;
     }
     lz.r = 0;
+}
+
+uint32_t llama_memory_recurrent_context::get_rs_snap_max() const {
+    return mem->n_rs_snap_max;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

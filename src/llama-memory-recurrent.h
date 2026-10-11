@@ -101,6 +101,14 @@ public:
     bool lz_batch(uint32_t n_seq_tokens) const { return lz_enabled && n_seq_tokens >= 1 && n_seq_tokens <= lz_max_batch; }
     void lz_reset() { lz = lz_state(); }
 
+    // ubatches with at least this many tokens per seq write only the final state (0: always all snapshots)
+    uint32_t n_rs_snap_max = 0;
+
+    // per seq: the last ubatch wrote all rollback snapshots
+    std::vector<bool> rs_snap_ok;
+
+    void set_rs_snap_ok(const llama_ubatch & ubatch);
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -209,6 +217,8 @@ public:
     ggml_tensor * get_lz_log(int32_t il) const;
     bool lz_batch(uint32_t n_seq_tokens) const;
     void set_input_lz(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    uint32_t get_rs_snap_max() const;
 
     // true when the main state rows are already in the cache slots that this ubatch will write
     // back to, i.e. s_copy(i) == head + i for all i < n_seqs. build_rs() can then hand out a view
