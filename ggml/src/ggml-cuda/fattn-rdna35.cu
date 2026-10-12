@@ -1031,7 +1031,7 @@ static void launch_fattn_rdna35(ggml_backend_cuda_context & ctx, ggml_tensor * d
                 const int64_t s31 = mask->nb[1] / sizeof(half2);
                 const int64_t s33 = mask->nb[3] / sizeof(half2);
                 flash_attn_mask_to_KV_max<NCOLS1><<<dim3(ntiles, Q->ne[3], 1), dim3(FATTN_KQ_STRIDE/2, 1, 1), 0, stream>>>(
-                    (const half2 *) mask->data, kv_max_ptr, K->ne[1] / FATTN_KQ_STRIDE, s31, s33);
+                    (const half2 *) mask->data, kv_max_ptr, K->ne[1] / FATTN_KQ_STRIDE, s31, s33, int(Q->ne[1]));
                 CUDA_CHECK(cudaGetLastError());
             }
             const int n_blk = (K->ne[1] + CLS_BLOCK_KEYS - 1) / CLS_BLOCK_KEYS;
