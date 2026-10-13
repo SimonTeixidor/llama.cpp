@@ -7709,6 +7709,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_memset_join(cuda_ctx);
     cuda_ctx->compute_epoch++;
+    if (ggml_cuda_mmb_marks_count(*cuda_ctx) > 0) {
+        const uint64_t sig = ggml_cuda_graph_sig(cgraph);
+        if (std::find(cuda_ctx->mmb_graph_sigs.begin(), cuda_ctx->mmb_graph_sigs.end(), sig) == cuda_ctx->mmb_graph_sigs.end()) {
+            ggml_cuda_mmb_marks_clear(*cuda_ctx);
+            cuda_ctx->mmb_graph_sigs.clear();
+            cuda_ctx->mmb_res16_pending.clear();
+            cuda_ctx->mmb_first_split = nullptr;
+        }
+    }
     ggml_cuda_mmb_begin_graph(*cuda_ctx);
 
     ggml_cuda_set_device(cuda_ctx->device);
